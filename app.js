@@ -12,6 +12,7 @@ const RATE_MAX = 90;
 const rateBuckets = new Map();
 
 function rateLimit(req, res, next) {
+  if (req.path === "/proxy") return next();
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   const now = Date.now();
   const bucket = rateBuckets.get(ip) || [];
@@ -36,7 +37,7 @@ app.use((req, res, next) => {
   res.set({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With, Range",
   });
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -182,6 +183,59 @@ app.get("/stream/:animeId/:slug/:ep", wrap((req) => {
     blockNonMp4
   );
 }));
+
+const { Readable } = require("stream");
+const PROXY_ALLOWED = /(^|\.)(my\.id|kuramanime\.(ink|ing|id))$|\.cloudfront\.net$/i;
+
+app.get("/proxy", async (req, res) => {
+  const raw = req.query.url;
+  if (!raw || !/^https?:\/\//i.test(String(raw))) {
+    return res.status(400).json({ error: "url tidak valid" });
+  }
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(String(raw));
+  } catch {
+    return res.status(400).json({ error: "url tidak valid" });
+  }
+  if (!PROXY_ALLOWED.test(upstreamUrl.hostname)) {
+    return res.status(403).json({ error: "domain tidak diizinkan" });
+  }
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+    "Referer": "https://v17.kuramanime.ink/",
+    "Accept": "*/*",
+  };
+  if (req.headers.range) headers["Range"] = req.headers.range;
+
+  let upstream;
+  try {
+    upstream = await fetch(upstreamUrl.toString(), { headers });
+  } catch (e) {
+    return res.status(502).json({ error: String(e && e.message) });
+  }
+
+  res.status(upstream.status);
+  res.set({
+    "Content-Type": upstream.headers.get("content-type") || "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Content-Disposition": "inline",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+  });
+  const cl = upstream.headers.get("content-length");
+  if (cl) res.set("Content-Length", cl);
+  const cr = upstream.headers.get("content-range");
+  if (cr) res.set("Content-Range", cr);
+
+  if (!upstream.body) {
+    return res.status(upstream.status || 502).end();
+  }
+  Readable.fromWeb(upstream.body).pipe(res);
+});
 
 app.use((err, _req, res, _next) => {
   const status = err.status || 502;
