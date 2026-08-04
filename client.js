@@ -121,8 +121,40 @@ async function pace() {
   lastRequestAt = Date.now();
 }
 
+const MAX_CONCURRENT = 3;
+let activeCount = 0;
+const waitQueue = [];
+
+function semaphore(fn) {
+  return new Promise((resolve, reject) => {
+    waitQueue.push({ fn, resolve, reject });
+    pump();
+  });
+}
+
+function pump() {
+  if (activeCount >= MAX_CONCURRENT || !waitQueue.length) return;
+  activeCount++;
+  const { fn, resolve, reject } = waitQueue.shift();
+  Promise.resolve()
+    .then(fn)
+    .then(resolve, reject)
+    .finally(() => {
+      activeCount--;
+      pump();
+    });
+}
+
+const MAX_CACHE = 500;
 const cache = new Map();
 const inflight = new Map();
+
+function cacheSet(key, entry) {
+  cache.set(key, entry);
+  if (cache.size > MAX_CACHE) {
+    cache.delete(cache.keys().next().value);
+  }
+}
 
 async function request(path, options = {}) {
   const { retries = 3, noCache = false } = options;
@@ -143,13 +175,13 @@ async function request(path, options = {}) {
     let res;
     for (let attempt = 0; ; attempt++) {
       if (!options.noPace) await pace();
-      res = await doRequest(path, options);
+      res = await semaphore(() => doRequest(path, options));
       if (attempt >= retries || !isChallenge(res)) break;
       cookieJar.delete(host);
       cooldownUntil = Date.now() + 9000 * (attempt + 1);
       await sleep(900 * (attempt + 1));
     }
-    if (ttl) cache.set(key, { expires: Date.now() + ttl, data: res });
+    if (ttl) cacheSet(key, { expires: Date.now() + ttl, data: res });
     return res;
   })();
 

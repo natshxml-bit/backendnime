@@ -3,6 +3,7 @@ const stream = require("./stream");
 const client = require("./client");
 
 const resultCache = new Map();
+const MAX_RESULT_CACHE = 300;
 
 function cached(key, ttlMs, fn) {
   const hit = resultCache.get(key);
@@ -14,6 +15,9 @@ function cached(key, ttlMs, fn) {
       throw e;
     });
   resultCache.set(key, { expires: Date.now() + ttlMs, value });
+  if (resultCache.size > MAX_RESULT_CACHE) {
+    resultCache.delete(resultCache.keys().next().value);
+  }
   return value;
 }
 

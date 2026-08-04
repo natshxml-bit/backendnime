@@ -5,6 +5,33 @@ const adapter = require("./adapter");
 
 const app = express();
 
+app.set("trust proxy", true);
+
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = 90;
+const rateBuckets = new Map();
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const bucket = rateBuckets.get(ip) || [];
+  while (bucket.length && bucket[0] <= now - RATE_WINDOW_MS) bucket.shift();
+  if (bucket.length >= RATE_MAX) {
+    return res.status(429).json({ error: "terlalu banyak request, coba lagi nanti" });
+  }
+  bucket.push(now);
+  rateBuckets.set(ip, bucket);
+  next();
+}
+
+setInterval(() => {
+  for (const [ip, bucket] of rateBuckets) {
+    if (!bucket.length) rateBuckets.delete(ip);
+  }
+}, 60 * 1000);
+
+app.use(rateLimit);
+
 app.use((req, res, next) => {
   res.set({
     "Access-Control-Allow-Origin": "*",

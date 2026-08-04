@@ -39,6 +39,26 @@ async function getJsVars(noPace = false) {
 
 const QUALITY_ORDER = [2160, 1080, 720, 480, 360];
 
+const STREAM_CACHE_TTL = 5 * 60 * 1000;
+const STREAM_CACHE_MAX = 300;
+const streamCache = new Map();
+
+function cacheStream(key, fn) {
+  const hit = streamCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  const value = Promise.resolve()
+    .then(fn)
+    .catch((e) => {
+      streamCache.delete(key);
+      throw e;
+    });
+  streamCache.set(key, { expires: Date.now() + STREAM_CACHE_TTL, value });
+  if (streamCache.size > STREAM_CACHE_MAX) {
+    streamCache.delete(streamCache.keys().next().value);
+  }
+  return value;
+}
+
 async function getStream(
   animeId,
   slug,
@@ -46,6 +66,11 @@ async function getStream(
   server = "kuramadrive",
   blockNonMp4 = true
 ) {
+  const key = `${animeId}/${slug}/${ep}/${server}/${blockNonMp4 ? 1 : 0}`;
+  return cacheStream(key, () => resolveWithRetry(animeId, slug, ep, server, blockNonMp4));
+}
+
+async function resolveWithRetry(animeId, slug, ep, server, blockNonMp4) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const result = await resolveStream(animeId, slug, ep, server, blockNonMp4);
     if (
