@@ -1,6 +1,7 @@
 const scraper = require("./scraper");
 const stream = require("./stream");
 const client = require("./client");
+const moov = require("./moov");
 
 const resultCache = new Map();
 const MAX_RESULT_CACHE = 300;
@@ -316,6 +317,9 @@ async function episode(slug) {
                 { title: preferred.name || preferred.id, url: src.url, quality: src.quality },
               ],
             });
+            if (src.url && !/r2\.cloudflarestorage\.com/.test(src.url)) {
+              moov.prefetch(src.url);
+            }
           }
           defaultStreamingUrl = st.stream_url;
         } else if (st.type === "mp4" && st.stream_url) {

@@ -185,6 +185,7 @@ app.get("/stream/:animeId/:slug/:ep", wrap((req) => {
 }));
 
 const { Readable } = require("stream");
+const moov = require("./moov");
 const PROXY_ALLOWED = /(^|\.)(my\.id|kuramanime\.(ink|ing|id))$|\.cloudfront\.net$/i;
 
 app.get("/proxy", async (req, res) => {
@@ -200,6 +201,33 @@ app.get("/proxy", async (req, res) => {
   }
   if (!PROXY_ALLOWED.test(upstreamUrl.hostname)) {
     return res.status(403).json({ error: "domain tidak diizinkan" });
+  }
+
+  const cached = moov.get(String(raw));
+  if (cached && cached.buf && cached.total) {
+    const range = req.headers.range;
+    if (range) {
+      const m = /^bytes=(\d*)-(\d*)/.exec(range);
+      const start = m && m[1] ? parseInt(m[1], 10) : 0;
+      if (start < cached.buf.length) {
+        let end = m && m[2] ? parseInt(m[2], 10) : cached.buf.length - 1;
+        end = Math.min(end, cached.buf.length - 1);
+        const slice = cached.buf.slice(start, end + 1);
+        res.status(206);
+        res.set({
+          "Content-Type": "video/mp4",
+          "Content-Length": String(slice.length),
+          "Content-Range": `bytes ${start}-${end}/${cached.total}`,
+          "Accept-Ranges": "bytes",
+          "Content-Disposition": "inline",
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+          "X-Moov-Cache": "HIT",
+        });
+        return res.end(slice);
+      }
+    }
   }
 
   const headers = {
