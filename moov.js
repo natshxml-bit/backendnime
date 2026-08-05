@@ -37,9 +37,7 @@ function prefetch(url) {
 
 function get(url) {
   const e = map.get(url);
-  if (!e) return null;
-  if (e.buf) return e;
-  return null;
+  return e || null;
 }
 
 function sweep() {

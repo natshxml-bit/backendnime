@@ -297,7 +297,7 @@ async function episode(slug) {
   }
 
   const key = `/anime/${id}/${eSlug}/episode/${ep}`;
-  return cached(key, 10 * 60 * 1000, async () => {
+  return cached(key, 30 * 60 * 1000, async () => {
     const d = await scraper.getEpisode(id, eSlug, ep);
     const servers = d.servers || [];
     const preferred =

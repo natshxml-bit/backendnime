@@ -7,13 +7,13 @@ const UA =
 const cookieJar = new Map();
 
 const TTL_RULES = [
-  { re: /\/anime\/\d+/, ttl: 10 * 60 * 1000 },
+  { re: /\/anime\/\d+/, ttl: 30 * 60 * 1000 },
   { re: /\/quick\//, ttl: 5 * 60 * 1000 },
   { re: /\/properties\//, ttl: 5 * 60 * 1000 },
   { re: /^\/$/, ttl: 5 * 60 * 1000 },
   { re: /\/schedule/, ttl: 10 * 60 * 1000 },
   { re: /\/quicksearch/, ttl: 2 * 60 * 1000 },
-  { re: /\/episode\//, ttl: 2 * 60 * 1000 },
+  { re: /\/episode\//, ttl: 30 * 60 * 1000 },
 ];
 
 function ttlFor(url) {
@@ -106,7 +106,7 @@ function isChallenge(res) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const MIN_GAP_MS = 200;
+const MIN_GAP_MS = 350;
 let lastRequestAt = 0;
 let cooldownUntil = 0;
 

@@ -203,7 +203,16 @@ app.get("/proxy", async (req, res) => {
     return res.status(403).json({ error: "domain tidak diizinkan" });
   }
 
-  const cached = moov.get(String(raw));
+  let cached = moov.get(String(raw));
+  if (cached && cached.promise && !cached.buf) {
+    try {
+      await Promise.race([
+        cached.promise,
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+    } catch {}
+    cached = moov.get(String(raw));
+  }
   if (cached && cached.buf && cached.total) {
     const range = req.headers.range;
     if (range) {

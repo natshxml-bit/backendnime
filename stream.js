@@ -39,7 +39,7 @@ async function getJsVars(noPace = false) {
 
 const QUALITY_ORDER = [2160, 1080, 720, 480, 360];
 
-const STREAM_CACHE_TTL = 5 * 60 * 1000;
+const STREAM_CACHE_TTL = 30 * 60 * 1000;
 const STREAM_CACHE_MAX = 300;
 const streamCache = new Map();
 
