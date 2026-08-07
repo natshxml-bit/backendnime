@@ -65,11 +65,31 @@ const messaging = getMessaging();
 let maxByAnime = {};
 try {
   maxByAnime = JSON.parse(fs.readFileSync(SNAPSHOT_FILE, "utf8"));
+  console.log(`[watcher] snapshot lokal dimuat (${Object.keys(maxByAnime).length} anime)`);
 } catch {}
+
+// preferensi: snapshot Firestore (persist antar restart di Railway)
+const SNAPSHOT_DOC = "watcherSnapshotDoc";
+let snapshotLoadedFromRemote = false;
+
+async function loadRemoteSnapshot() {
+  try {
+    const snap = await db.collection("_system").doc(SNAPSHOT_DOC).get();
+    if (snap.exists && snap.data().maxByAnime) {
+      maxByAnime = snap.data().maxByAnime;
+      snapshotLoadedFromRemote = true;
+      baselineDone = true;
+      console.log(`[watcher] snapshot Firestore dimuat (${Object.keys(maxByAnime).length} anime)`);
+    }
+  } catch {}
+}
 
 let lastNotified = {}; // animeId -> timestamp
 let dailyCount = {}; // animeId -> { date: "YYYY-MM-DD", count: number }
 let baselineDone = false;
+
+// kalau snapshot lama ada, tick pertama langsung bisa deteksi episode baru
+if (Object.keys(maxByAnime).length > 0) baselineDone = true;
 
 function dayKey() {
   return new Date().toLocaleDateString("sv-SE");
@@ -97,8 +117,16 @@ async function getAllUsers() {
 }
 
 async function saveSnapshot() {
-  fs.mkdirSync(path.dirname(SNAPSHOT_FILE), { recursive: true });
-  fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(maxByAnime));
+  // simpan ke Firestore biar persist di Railway (file lokal ephemeral)
+  try {
+    await db.collection("_system").doc(SNAPSHOT_DOC).set({ maxByAnime, updatedAt: FieldValue.serverTimestamp() });
+  } catch (e) {
+    console.error("[watcher] gagal simpan snapshot Firestore:", e.message);
+  }
+  try {
+    fs.mkdirSync(path.dirname(SNAPSHOT_FILE), { recursive: true });
+    fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(maxByAnime));
+  } catch {}
 }
 
 async function notifyEpisode(anime, ep, users, tokens) {
@@ -244,6 +272,7 @@ if (process.argv.includes("--test")) {
   // jadi API bisa belum siap saat tick pertama
   async function startWithRetry(attempt = 1) {
     try {
+      await loadRemoteSnapshot();
       await tick();
       setInterval(tick, POLL_MS);
       console.log("[watcher] tick pertama sukses, interval terjadwal");
