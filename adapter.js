@@ -608,7 +608,7 @@ async function listByType(type, page = 1) {
         const slug = normalizeSlug(x.url || x.link || x.id);
         const s = STATUS[slug]?.s || "";
         if (/UPCOMING|PENGUMUMAN/i.test(s)) {
-          const title = String(x.title || x.name || "");
+          const title = String(x.title || x.judul || x.anime_name || x.name || "");
           if (/takedown|\[info\]/i.test(title)) return false;
           return true;
         }
