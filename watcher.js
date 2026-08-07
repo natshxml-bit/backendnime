@@ -119,7 +119,7 @@ async function notifyEpisode(anime, ep, users, tokens) {
     try {
       const resp = await messaging.sendEachForMulticast({
         tokens: chunk,
-        notification: { title, body, sound: "default" },
+        notification: { title, body },
         android: { priority: "high", notification: { channelId: "episode_rilis" } },
         data: { animeId: String(animeId), url: link },
       });
