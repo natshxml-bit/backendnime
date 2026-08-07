@@ -12,7 +12,6 @@ const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
 const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "15", 10) * 60 * 1000;
 const COOLDOWN_MS = 10 * 60 * 1000;
-const DAILY_CAP_PER_ANIME = 4;
 
 function loadCredential() {
   if (fs.existsSync(SERVICE_ACCOUNT)) {
@@ -85,15 +84,10 @@ async function loadRemoteSnapshot() {
 }
 
 let lastNotified = {}; // animeId -> timestamp
-let dailyCount = {}; // animeId -> { date: "YYYY-MM-DD", count: number }
 let baselineDone = false;
 
 // kalau snapshot lama ada, tick pertama langsung bisa deteksi episode baru
 if (Object.keys(maxByAnime).length > 0) baselineDone = true;
-
-function dayKey() {
-  return new Date().toLocaleDateString("sv-SE");
-}
 
 function cleanTitle(t) {
   return String(t || "").replace(/Subtitle Indonesia/gi, "").trim();
@@ -211,17 +205,10 @@ async function tick() {
     }
 
     if (newEpisodes.length > 0 && baselineDone) {
-      const today = dayKey();
       for (const { anime, ep } of newEpisodes) {
         const animeId = anime.animeId || anime.id;
         if (now - (lastNotified[animeId] || 0) < COOLDOWN_MS) continue;
-        const rec = dailyCount[animeId];
-        if (rec && rec.date === today && rec.count >= DAILY_CAP_PER_ANIME) {
-          console.log(`[watcher] dilewati (cap harian): ${cleanTitle(anime.title)} EP ${ep}`);
-          continue;
-        }
         lastNotified[animeId] = now;
-        dailyCount[animeId] = rec && rec.date === today ? { date: today, count: rec.count + 1 } : { date: today, count: 1 };
         console.log(`[watcher] Episode baru terdeteksi: ${cleanTitle(anime.title)} EP ${ep}`);
         await notifyEpisode(anime, ep, users, tokens);
       }
