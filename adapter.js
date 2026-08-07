@@ -423,9 +423,7 @@ function cardFromList(it) {
     type: st?.type || it.type || null,
     episode: st?.eps ?? it.lastch ?? it.episode ?? null,
     quality: null,
-    genres: Array.isArray(it.genre) && it.genre.length > 0
-      ? it.genre
-      : (GENRE_CACHE.get(slug)?.genres || []),
+    genres: Array.isArray(it.genre) ? it.genre : [],
   };
 }
 
@@ -450,45 +448,6 @@ async function getSeries(slug) {
     return data;
   });
   return d;
-}
-
-// Cache genre per slug — diisi on-demand via genreBatch, lalu dipakai enrich semua list response
-const GENRE_CACHE = new Map();
-const GENRE_TTL = 30 * 60 * 1000;
-
-async function genresForSlug(slug) {
-  const s = normalizeSlug(slug);
-  if (!s) return [];
-  const hit = GENRE_CACHE.get(s);
-  if (hit && Date.now() - hit.ts < GENRE_TTL) return hit.genres;
-  try {
-    const d = await getSeries(s);
-    const g = Array.isArray(d.genre) ? d.genre : [];
-    GENRE_CACHE.set(s, { genres: g, ts: Date.now() });
-    if (GENRE_CACHE.size > 3000) GENRE_CACHE.delete(GENRE_CACHE.keys().next().value);
-    return g;
-  } catch {
-    return [];
-  }
-}
-
-async function genreBatch(slugs) {
-  const list = String(slugs || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 300);
-  const out = {};
-  let i = 0;
-  const CONC = 6;
-  async function worker() {
-    while (i < list.length) {
-      const s = list[i++];
-      out[normalizeSlug(s)] = await genresForSlug(s);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONC, list.length) }, worker));
-  return { genres: out, total: list.length };
 }
 
 async function getEpisodeData(epUrl) {
@@ -697,7 +656,8 @@ async function byGenre(slug, page = 1) {
     genre: slug,
     page,
     genreList: items,
-    animeList: items,    has_next: items.length >= 25,
+    animeList: items,
+    has_next: items.length >= 25,
     next_page: items.length >= 25 ? page + 1 : null,
   };
 }
@@ -833,7 +793,6 @@ module.exports = {
   animeDetail,
   schedule,
   genres,
-  genreBatch,
   ongoing,
   complete,
   listByType,
