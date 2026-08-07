@@ -607,7 +607,12 @@ async function listByType(type, page = 1) {
       .filter((x) => {
         const slug = normalizeSlug(x.url || x.link || x.id);
         const s = STATUS[slug]?.s || "";
-        return /UPCOMING|PENGUMUMAN/i.test(s);
+        if (/UPCOMING|PENGUMUMAN/i.test(s)) {
+          const title = String(x.title || x.name || "");
+          if (/takedown|\[info\]/i.test(title)) return false;
+          return true;
+        }
+        return false;
       })
       .map(cardFromList);
     return listOf("upcoming", page, items.slice(start, start + 30), items.length);
