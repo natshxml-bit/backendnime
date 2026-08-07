@@ -10,12 +10,16 @@ function getAdmin() {
   const saPath = path.join(__dirname, "service-account.json");
   if (fs.existsSync(saPath)) {
     adminApp = initializeApp({ credential: cert(saPath) });
+  } else if (process.env.FIREBASE_SA_JSON) {
+    adminApp = initializeApp({
+      credential: cert(JSON.parse(process.env.FIREBASE_SA_JSON)),
+    });
   } else if (process.env.FIREBASE_SA_B64) {
     adminApp = initializeApp({
       credential: cert(JSON.parse(Buffer.from(process.env.FIREBASE_SA_B64, "base64").toString("utf8"))),
     });
   } else {
-    throw new Error("service-account.json tidak ada dan FIREBASE_SA_B64 kosong");
+    throw new Error("service-account.json tidak ada dan FIREBASE_SA_JSON/B64 kosong");
   }
   return adminApp;
 }
