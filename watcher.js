@@ -14,6 +14,19 @@ const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "30", 10) * 60 * 1000
 const COOLDOWN_MS = 20 * 60 * 1000;
 const DAILY_CAP_PER_ANIME = 4;
 
+function loadCredential() {
+  if (fs.existsSync(SERVICE_ACCOUNT)) {
+    return { credential: cert(SERVICE_ACCOUNT) };
+  }
+  if (process.env.FIREBASE_SA_JSON) {
+    return { credential: cert(JSON.parse(process.env.FIREBASE_SA_JSON)) };
+  }
+  if (process.env.FIREBASE_SA_B64) {
+    return { credential: cert(JSON.parse(Buffer.from(process.env.FIREBASE_SA_B64, "base64").toString("utf8"))) };
+  }
+  return null;
+}
+
 // cegah watcher ganda (lock file, stale jika > 5 menit)
 function acquireLock() {
   fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
@@ -36,14 +49,15 @@ function acquireLock() {
   }
 }
 
-if (!fs.existsSync(SERVICE_ACCOUNT)) {
-  console.error("[watcher] service-account.json tidak ditemukan!");
+const cred = loadCredential();
+if (!cred) {
+  console.error("[watcher] service-account.json / FIREBASE_SA_JSON tidak ditemukan!");
   process.exit(1);
 }
 
 if (!acquireLock()) process.exit(1);
 
-initializeApp({ credential: cert(SERVICE_ACCOUNT) });
+initializeApp(cred);
 const db = getFirestore();
 const messaging = getMessaging();
 
