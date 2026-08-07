@@ -86,8 +86,27 @@ app.get("/", (_req, res) => {
       "GET /complete-anime?page=1": "anime selesai",
       "GET /list/{type}?page=1": "type: ongoing|finished|upcoming|movie|donghua|anime",
       "GET /proxy?url=...": "proxy video mp4",
+      "GET /watcher-status": "status watcher (heartbeat dari Firestore)",
     },
   });
+});
+
+// status watcher: baca heartbeat yang ditulis watcher tiap tick
+app.get("/watcher-status", async (_req, res) => {
+  try {
+    const snap = await adminFs(getAdmin()).collection("_system").doc("watcher").get();
+    if (!snap.exists) return res.status(404).json({ error: "watcher belum pernah tick (heartbeat kosong)" });
+    const d = snap.data();
+    res.json({
+      lastTick: d.lastTick ? new Date(d.lastTick.toMillis()).toISOString() : null,
+      lastTickMs: d.lastTick ? d.lastTick.toMillis() : null,
+      ageSeconds: d.lastTick ? Math.round((Date.now() - d.lastTick.toMillis()) / 1000) : null,
+      lastError: d.lastError || null,
+      episodeCount: d.episodeCount || 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const wrap = (fn) => (req, res) => {

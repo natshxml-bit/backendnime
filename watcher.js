@@ -203,9 +203,22 @@ async function tick() {
 
     baselineDone = true;
     await saveSnapshot();
+    await heartbeat(null);
   } catch (e) {
     console.error("[watcher] tick error:", e.message);
+    await heartbeat(String(e?.message || "error"));
   }
+}
+
+// heartbeat: tulis status tiap tick ke Firestore biar bisa dicek dari luar
+async function heartbeat(err) {
+  try {
+    await db.collection("_system").doc("watcher").set({
+      lastTick: FieldValue.serverTimestamp(),
+      lastError: err || null,
+      episodeCount: Object.keys(maxByAnime).length,
+    }, { merge: true });
+  } catch {}
 }
 
 async function sendTest() {
