@@ -258,6 +258,8 @@ app.get("/genre/:slug", wrap((req) => {
   return adapter.byGenre(req.params.slug, page);
 }));
 
+app.get("/genre-batch", wrap((req) => adapter.genreBatch(req.query.slugs)));
+
 app.get("/search/:query", wrap((req) => adapter.searchQuery(req.params.query)));
 
 app.get("/ongoing-anime", wrap((req) => {
