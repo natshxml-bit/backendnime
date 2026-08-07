@@ -1,7 +1,7 @@
 {
-  "name": "kuramanime-scraper-api",
-  "version": "1.0.0",
-  "description": "Kuramanime scraper API (Node.js)",
+  "name": "tsukinime-api",
+  "version": "3.0.0",
+  "description": "TsukiNime API (sumber: animekita)",
   "main": "app.js",
   "type": "commonjs",
   "scripts": {
@@ -11,7 +11,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "cheerio": "1.0.0",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "firebase-admin": "^14.2.0"
   }
 }

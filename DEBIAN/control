@@ -1,0 +1,8 @@
+Package: aapt2
+Architecture: aarch64
+Installed-Size: 3540
+Maintainer: @termux
+Version: 16.0.0.4-1
+Homepage: https://github.com/termux/android-build-tools
+Depends: abseil-cpp, libprotobuf, fmt, libc++, libexpat, libpng, libzopfli, zlib
+Description: AAPT2 (Android Asset Packaging Tool)

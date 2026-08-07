@@ -1,7 +1,188 @@
-const scraper = require("./scraper");
-const stream = require("./stream");
-const client = require("./client");
-const moov = require("./moov");
+const API_BASE = "https://apps.animekita.org/api/v1.2.5";
+const UA = "Dart/2.19.6 (dart:io)";
+
+const fs = require("fs");
+const path = require("path");
+const STATUS_FILE = path.join(__dirname, "statuses.json");
+const ANILIST_POSTER_FILE = path.join(__dirname, "anilistPosters.json");
+const SLUG_POSTER_FILE = path.join(__dirname, "posterBySlug.json");
+const ANILIST_GRAPHQL = "https://graphql.anilist.co";
+const CRAWL_DELAY_MS = 180;
+const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
+
+let STATUS = {};
+try {
+  STATUS = JSON.parse(fs.readFileSync(STATUS_FILE, "utf8")) || {};
+} catch {}
+
+let POSTERS = {};
+try {
+  POSTERS = JSON.parse(fs.readFileSync(ANILIST_POSTER_FILE, "utf8")) || {};
+} catch {}
+
+let POSTER_BY_SLUG = {};
+try {
+  POSTER_BY_SLUG = JSON.parse(fs.readFileSync(SLUG_POSTER_FILE, "utf8")) || {};
+} catch {}
+
+function saveStatuses() {
+  try {
+    fs.writeFileSync(STATUS_FILE, JSON.stringify(STATUS));
+  } catch {}
+}
+
+function savePosters() {
+  try {
+    fs.writeFileSync(ANILIST_POSTER_FILE, JSON.stringify(POSTERS));
+  } catch {}
+}
+
+function saveSlugPosters() {
+  try {
+    fs.writeFileSync(SLUG_POSTER_FILE, JSON.stringify(POSTER_BY_SLUG));
+  } catch {}
+}
+
+const ONGOING_RE = /ONGOING|SEDANG TAYANG|AIRING|ONGOING_ANIME/i;
+const COMPLETED_RE = /SELESAI|TAMAT|COMPLETED|FINISHED|ENDED/i;
+
+function statusOf(slug) {
+  const entry = STATUS[normalizeSlug(slug)];
+  return entry ? entry.s : null;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fullList() {
+  const d = await cached("animeList:full", 15 * 60 * 1000, () =>
+    apiGet("anime-list.php")
+  );
+  return Array.isArray(d) ? d : Object.values(d || {}).flat().filter(Boolean);
+}
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function fetchSeriesStatus(slug) {
+  const s = normalizeSlug(slug);
+  let data = null;
+  try {
+    data = await apiGet("series.php", { url: s });
+  } catch {}
+  let series = data && Array.isArray(data.data) ? data.data[0] : null;
+  if (!series || !series.series_id) {
+    try {
+      data = await apiGet("series.php", { url: `${s}/` });
+    } catch {}
+    series = data && Array.isArray(data.data) ? data.data[0] : null;
+  }
+  return series;
+}
+
+async function crawlWorker() {
+  try {
+    const flat = await fullList();
+    const now = Date.now();
+    const todo = flat.filter((x) => {
+      const slug = normalizeSlug(x.url || x.link || x.id);
+      const entry = STATUS[slug];
+      return !entry || now - entry.t > STATUS_TTL_MS;
+    });
+    if (todo.length === 0) return;
+    let saved = 0;
+    for (const item of todo) {
+      const slug = normalizeSlug(item.url || item.link || item.id);
+      try {
+        const series = await fetchSeriesStatus(slug);
+        if (series && series.status) {
+          STATUS[slug] = {
+            s: normalizeStatus(series.status),
+            t: Date.now(),
+            type: series.type || STATUS[slug]?.type || null,
+            eps: Array.isArray(series.chapter) ? series.chapter.length : STATUS[slug]?.eps || null,
+          };
+          if (++saved % 25 === 0) saveStatuses();
+        }
+      } catch {}
+      await sleep(CRAWL_DELAY_MS);
+    }
+    saveStatuses();
+  } catch {}
+}
+
+function startCrawler() {
+  crawlWorker().then(() => setTimeout(startCrawler, 30 * 60 * 1000));
+}
+
+function isMovieStatus(entry) {
+  return entry && String(entry.type || "").toLowerCase() === "movie";
+}
+
+async function statusList(type, page = 1) {
+  const flat = await fullList();
+  const re = type === "ongoing" ? ONGOING_RE : COMPLETED_RE;
+  const known = flat.filter((x) => {
+    const slug = normalizeSlug(x.url || x.link || x.id);
+    const s = statusOf(slug);
+    if (!s || !re.test(s)) return false;
+    if (isMovieStatus(STATUS[slug])) return false;
+    return true;
+  });
+  const start = (page - 1) * 30;
+  const items = known.slice(start, start + 30).map(cardFromList);
+  return listOf(type, page, items, known.length);
+}
+
+const RECOMMEND_KEYWORDS = ["action", "adventure", "comedy", "drama", "fantasy", "isekai", "romance", "horror", "sci-fi", "sports", "music", "military", "school", "supernatural", "thriller"];
+
+async function recommendationPool() {
+  return cached("reco:pool", 6 * 60 * 60 * 1000, async () => {
+    const pool = [];
+    for (const kw of RECOMMEND_KEYWORDS) {
+      try {
+        const res = await apiGet("search.php", { keyword: kw });
+        const groups = Array.isArray(res.data) ? res.data : [];
+        for (const g of groups) {
+          for (const it of (g?.result || [])) pool.push(it);
+        }
+      } catch {}
+      await sleep(300);
+    }
+    return pool;
+  });
+}
+
+async function recommendations(limit = 12) {
+  const pool = await recommendationPool();
+  const seen = new Set();
+  const out = [];
+  for (const it of shuffle(pool)) {
+    const slug = normalizeSlug(it.url || it.link);
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    out.push({
+      animeId: slug,
+      title: it.judul || it.anime_name,
+      poster: POSTER_BY_SLUG[slug] || upscalePoster(it.cover || it.thumb),
+      score: null,
+      status: null,
+      episode: it.lastch || null,
+      type: it.type || null,
+      genres: Array.isArray(it.genre) ? it.genre : [],
+      synopsis: it.sinopsis || null,
+    });
+    if (out.length >= limit) break;
+  }
+  return { animeList: out };
+}
 
 const resultCache = new Map();
 const MAX_RESULT_CACHE = 300;
@@ -22,11 +203,229 @@ function cached(key, ttlMs, fn) {
   return value;
 }
 
-const DAY_ORDER = ["senin", "selasa", "rabu", "kamis", "jumat", "sabtu", "minggu"];
-const DAY_EN = {
-  senin: "monday", selasa: "tuesday", rabu: "wednesday", kamis: "thursday",
-  jumat: "friday", sabtu: "saturday", minggu: "sunday",
-};
+async function apiGet(path, params = {}) {
+  const url = new URL(`${API_BASE}/${path}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== "") url.searchParams.set(k, String(v));
+  }
+  const res = await fetch(url.toString(), {
+    headers: { "User-Agent": UA, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
+  let text = await res.text();
+  const start = text.search(/[\[{]/);
+  if (start >= 0) {
+    const open = text[start];
+    const close = open === "[" ? "]" : "}";
+    const end = text.lastIndexOf(close);
+    if (end > start) text = text.slice(start, end + 1);
+  }
+  const json = JSON.parse(text);
+  if (json && typeof json === "object" && json.error) {
+    throw new Error(json.error);
+  }
+  return json;
+}
+
+function normalizeSlug(slug) {
+  return String(slug || "")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/,/g, "/");
+}
+
+function anilistIdFromUrl(url) {
+  const m = String(url || "").match(/anilist[_-]?(\d+)/i);
+  return m ? m[1] : null;
+}
+
+function upscalePoster(url) {
+  if (!url) return url;
+  const id = anilistIdFromUrl(url);
+  if (id && POSTERS[String(id)]) return POSTERS[String(id)];
+  let out = String(url).replace(/^https?:\/\/i\d?\.wp\.com\//, "https://");
+  out = out.replace(/[?&](?:w|resize)=\d+(?:,\d+)?/g, "");
+  if (id) queueAnilistFetch(id);
+  return out || url;
+}
+
+const anilistQueue = [];
+const anilistFetched = new Set();
+let anilistRunning = false;
+
+function queueAnilistFetch(id) {
+  if (!id || anilistFetched.has(id)) return;
+  anilistFetched.add(id);
+  anilistQueue.push(id);
+  runAnilistQueue();
+}
+
+async function fetchAnilistByIds(ids) {
+  try {
+    const query = `query($ids:[Int]){Page(perPage:50){media(id_in:$ids,type:ANIME){id coverImage{extraLarge}}}}`;
+    const res = await fetch(ANILIST_GRAPHQL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ query, variables: { ids: ids.map(Number) } }),
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const media = json?.data?.Page?.media || [];
+    let changed = false;
+    for (const m of media) {
+      if (m?.coverImage?.extraLarge) {
+        POSTERS[String(m.id)] = m.coverImage.extraLarge;
+        changed = true;
+      }
+    }
+    if (changed) savePosters();
+  } catch {}
+}
+
+async function anilistSearchPoster(title) {
+  if (!title) return null;
+  try {
+    const query = `query($t:String){Page(perPage:3){media(search:$t,type:ANIME){id title{romaji english} coverImage{extraLarge}}}}`;
+    const res = await fetch(ANILIST_GRAPHQL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ query, variables: { t: String(title).slice(0, 60) } }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const m = json?.data?.Page?.media || [];
+    for (const cand of m) {
+      if (cand?.coverImage?.extraLarge) return cand.coverImage.extraLarge;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const titleSearchQueue = [];
+const titleSearched = new Set();
+let titleSearchRunning = false;
+
+function queueTitleSearch(title, slug) {
+  if (!title || !slug || titleSearched.has(slug)) return;
+  titleSearched.add(slug);
+  titleSearchQueue.push({ title, slug });
+  runTitleSearchQueue();
+}
+
+async function runTitleSearchQueue() {
+  if (titleSearchRunning) return;
+  titleSearchRunning = true;
+  while (titleSearchQueue.length) {
+    const batch = [];
+    while (titleSearchQueue.length && batch.length < 3) batch.push(titleSearchQueue.shift());
+    await Promise.all(batch.map(async ({ title, slug }) => {
+      const url = await anilistSearchPoster(title);
+      if (url && !POSTER_BY_SLUG[slug]) {
+        POSTER_BY_SLUG[slug] = url;
+        saveSlugPosters();
+      }
+    }));
+    await sleep(800);
+  }
+  titleSearchRunning = false;
+}
+
+async function verifyCovers() {
+  try {
+    const flat = await fullList();
+    let checked = 0;
+    for (const it of flat) {
+      const slug = normalizeSlug(it.url || it.link || it.id);
+      const cover = it.cover || it.thumb || "";
+      if (!cover) continue;
+      const id = anilistIdFromUrl(cover);
+      if (id && POSTERS[String(id)]) continue;
+      const direct = upscalePoster(cover);
+      if (!direct) continue;
+      if (/myanimelist\.net|s4\.anilist\.co|anilist\.co/.test(direct)) continue;
+      let alive = false;
+      try {
+        const res = await fetch(direct, {
+          headers: { "User-Agent": UA, Range: "bytes=0-0" },
+          redirect: "follow",
+        });
+        alive = res.ok || res.status === 206;
+      } catch {}
+      if (alive) {
+        if (POSTER_BY_SLUG[slug]) {
+          delete POSTER_BY_SLUG[slug];
+          saveSlugPosters();
+        }
+        continue;
+      }
+      if (POSTER_BY_SLUG[slug]) continue;
+      const url = await anilistSearchPoster(it.judul || it.anime_name || it.name);
+      if (url && !POSTER_BY_SLUG[slug]) {
+        POSTER_BY_SLUG[slug] = url;
+        saveSlugPosters();
+      }
+      checked++;
+      await sleep(150);
+    }
+    console.log(`[anilist] cover verify done (${checked} broken rescued)`);
+  } catch {}
+}
+
+async function runAnilistQueue() {
+  if (anilistRunning) return;
+  anilistRunning = true;
+  while (anilistQueue.length) {
+    const batch = [];
+    while (anilistQueue.length && batch.length < 40) batch.push(anilistQueue.shift());
+    await fetchAnilistByIds(batch);
+    await sleep(700);
+  }
+  anilistRunning = false;
+}
+
+async function fillPosterCache() {
+  try {
+    const flat = await fullList();
+    const need = new Set();
+    for (const it of flat) {
+      const id = anilistIdFromUrl(it.cover || it.thumb);
+      if (id && !POSTERS[String(id)]) need.add(String(id));
+    }
+    const ids = [...need];
+    for (let i = 0; i < ids.length; i += 40) {
+      await fetchAnilistByIds(ids.slice(i, i + 40));
+      await sleep(700);
+    }
+    console.log(`[anilist] poster cache ready (${ids.length} fetched)`);
+    verifyCovers().then(() => {});
+  } catch {}
+}
+
+function startPosterCrawler() {
+  fillPosterCache().then(() => setTimeout(startPosterCrawler, 6 * 60 * 60 * 1000));
+}
+
+function cardFromList(it) {
+  const slug = normalizeSlug(it.url || it.link) || it.id;
+  const cover = it.cover || it.thumb;
+  let poster = POSTER_BY_SLUG[slug] || upscalePoster(cover);
+  if (!POSTER_BY_SLUG[slug] && cover && /otakudesu\.blog/i.test(cover)) {
+    queueTitleSearch(it.judul || it.anime_name || it.name, slug);
+  }
+  const st = STATUS[slug];
+  return {
+    animeId: slug,
+    title: it.judul || it.anime_name || it.name,
+    poster,
+    score: null,
+    status: st?.s || it.status || null,
+    type: st?.type || it.type || null,
+    episode: st?.eps ?? it.lastch ?? it.episode ?? null,
+    quality: null,
+    genres: Array.isArray(it.genre) ? it.genre : [],
+  };
+}
 
 function normalizeStatus(status) {
   if (!status) return "Ongoing";
@@ -36,362 +435,362 @@ function normalizeStatus(status) {
   return status;
 }
 
-function pathFromUrl(url) {
-  if (!url) return null;
-  return String(url).replace(/^https?:\/\/[^/]+/, "");
+async function getSeries(slug) {
+  const s = normalizeSlug(slug);
+  const d = await cached(`series:${s}`, 30 * 60 * 1000, async () => {
+    let res = await apiGet("series.php", { url: s });
+    let data = Array.isArray(res.data) ? res.data[0] : null;
+    if (!data || !data.series_id) {
+      res = await apiGet("series.php", { url: `${s}/` });
+      data = Array.isArray(res.data) ? res.data[0] : null;
+    }
+    if (!data || !data.series_id) throw new Error(`series tidak ditemukan: ${slug}`);
+    return data;
+  });
+  return d;
 }
 
-function animePathFromUrl(url) {
-  if (!url) return null;
-  const m = String(url).match(/\/anime\/(\d+)(\/[^?#]*)?/);
-  if (!m) return null;
-  let rest = m[2] || "";
-  rest = rest.replace(/\/episode\/.*$/, "").replace(/\/batch\/.*$/, "");
-  return `/anime/${m[1]}${rest}`;
-}
-
-function idFromAnimeUrl(url) {
-  const m = String(url || "").match(/\/anime\/(\d+)/);
-  return m ? m[1] : null;
-}
-
-function parseRef(ref) {
-  const m = String(ref || "").match(/(\d+)(?:\/([^/?#]+))?/);
-  if (!m) return null;
-  return { id: m[1], slug: m[2] || null };
-}
-
-function parseEpisodeRef(ref) {
-  const m = String(ref || "").match(/\/(\d+)\/([^/?#]+)\/episode\/([0-9]+)(?:\?.*)?$/);
-  if (!m) return null;
-  return { id: m[1], slug: m[2], ep: m[3] };
-}
-
-function cardToTsuki(card) {
-  return {
-    animeId: idFromAnimeUrl(card.url) || card.url,
-    title: card.title,
-    poster: card.poster,
-    score: null,
-    status: normalizeStatus(card.status),
-    episode: card.episode,
-    type: card.type,
-    quality: card.quality,
-    genres: [],
-  };
+async function getEpisodeData(epUrl) {
+  return cached(`epdata:${epUrl}`, 30 * 60 * 1000, async () => {
+    let data = null;
+    try {
+      data = await apiGet("series/episode/data.php", { url: epUrl });
+    } catch {}
+    let ep = data && Array.isArray(data.data) ? data.data[0] : null;
+    if (!ep || !ep.episode_id) {
+      try {
+        data = await apiGet("series/episode/data.php", { url: `${epUrl}/` });
+      } catch {}
+      ep = data && Array.isArray(data.data) ? data.data[0] : null;
+    }
+    if (!ep || !ep.episode_id) throw new Error(`episode tidak ditemukan: ${epUrl}`);
+    return ep;
+  });
 }
 
 async function home() {
-  const data = await scraper.getHome();
-  const recent = (data.hero || []).map((h) => ({
-    animeId: idFromAnimeUrl(h.url) || h.url,
-    title: h.title,
-    poster: h.poster,
-    synopsis: h.description,
-    banner: h.poster,
+  const [uploads, movie] = await Promise.all([
+    cached("home:uploads", 5 * 60 * 1000, () => apiGet("baruupload.php", { page: 1 })),
+    cached("home:movie", 10 * 60 * 1000, () => apiGet("movie.php")),
+  ]);
+  const recent = (Array.isArray(uploads) ? uploads : []).map((c) => ({
+    ...cardFromList(c),
     status: "Ongoing",
-    genres: [],
+    genres: Array.isArray(c.genre) ? c.genre : [],
+    synopsis: c.sinopsis || null,
   }));
-  const section = (name) => ((data.sections || {})[name] || []).map(cardToTsuki);
+  const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 10);
+  const completedList = (await statusList("completed", 1)).animeList.slice(0, 10);
+  const movieList = (Array.isArray(movie) ? movie : []).map(cardFromList);
   return {
     recent,
-    ongoing: { animeList: section("Sedang Tayang") },
-    completed: { animeList: section("Selesai Tayang") },
-    film: { animeList: section("Film Layar Lebar") },
+    ongoing: { animeList: ongoingList },
+    completed: { animeList: completedList },
+    film: { animeList: movieList },
   };
 }
 
 async function animeDetail(ref) {
-  let parsed = parseRef(ref);
-  if (!parsed) throw new Error(`referensi anime tidak valid: ${ref}`);
-  let { id, slug } = parsed;
-  if (!slug) {
-    const r = await client.get(`/anime/${id}`);
-    const m = r.url.match(/\/anime\/(\d+)\/([^/?#]+)/);
-    if (m) {
-      id = m[1];
-      slug = m[2];
-    }
-  }
-  const d = await scraper.getDetail(id, slug);
-  const info = d.info || {};
-  const infoList = (k) => {
-    const v = info[k];
-    if (!v) return [];
-    return (Array.isArray(v) ? v : [v]).map(String);
-  };
-  const animeId = id;
-  const episodeList = (d.episodes || [])
-    .filter((ep) => (ep.url || "").includes("/episode/"))
-    .map((ep, i) => {
-      const epNum = (String(ep.url).match(/\/episode\/(\d+)/) || [])[1];
-      const eid = `${animeId}-${epNum || i + 1}`;
-      return { episodeId: eid, endpoint: eid, title: ep.title };
-    });
+  const slug = normalizeSlug(ref);
+  const d = await getSeries(slug);
+  const episodeList = (Array.isArray(d.chapter) ? d.chapter : [])
+    .map((c) => ({
+      episodeId: c.url,
+      endpoint: c.url,
+      title: `Episode ${String(c.ch).split(" ")[0]}`,
+      date: c.date || null,
+      views: c.views || null,
+    }))
+    .reverse();
+  const basePoster = upscalePoster(d.cover);
   return {
-    animeId,
-    title: d.title,
-    poster: d.poster,
-    banner: d.poster,
-    score: String(d.score || "").replace(/[^\d.]/g, "") || null,
-    status: normalizeStatus(infoList("Status")[0]),
-    type: infoList("Tipe")[0] || null,
-    synopsis: d.synopsis,
-    genres: infoList("Genre"),
+    animeId: d.series_id || slug,
+    title: d.judul,
+    poster: POSTER_BY_SLUG[slug] || basePoster,
+    banner: POSTER_BY_SLUG[slug] || basePoster,
+    score: String(d.rating || "").replace(/[^\d.]/g, "") || null,
+    status: normalizeStatus(d.status),
+    type: d.type || null,
+    synopsis: d.sinopsis || "",
+    genres: Array.isArray(d.genre) ? d.genre : [],
+    released: d.published || null,
+    author: d.author || null,
+    totalEpisodes: episodeList.length,
     episodeList,
-    minEpisode: d.minEpisode || 0,
-    maxEpisode: d.maxEpisode || 0,
+    minEpisode: 0,
+    maxEpisode: episodeList.length,
   };
-}
-
-async function animeEpisodePage(ref, page) {
-  let parsed = parseRef(ref);
-  if (!parsed) throw new Error(`referensi anime tidak valid: ${ref}`);
-  let { id, slug } = parsed;
-  if (!slug) {
-    const r = await client.get(`/anime/${id}`);
-    const m = r.url.match(/\/anime\/(\d+)\/([^/?#]+)/);
-    if (m) { id = m[1]; slug = m[2]; }
-  }
-  const eps = await scraper.getEpisodePage(id, slug, page);
-  return eps
-    .filter((ep) => (ep.url || "").includes("/episode/"))
-    .map((ep) => {
-      const epNum = (String(ep.url).match(/\/episode\/(\d+)/) || [])[1];
-      const eid = `${id}-${epNum}`;
-      return { episodeId: eid, endpoint: eid, title: ep.title };
-    });
 }
 
 async function schedule() {
-  const cheerio = require("cheerio");
-  const groups = {};
-
-  await Promise.all(
-    DAY_ORDER.map(async (day) => {
-      let html = "";
-      try {
-        const r = await client.get(`/schedule?scheduled_day=${DAY_EN[day]}`);
-        html = r.text;
-      } catch (e) {
-        html = "";
-      }
-      const $ = cheerio.load(html || "<html></html>");
-      const list = [];
-      $(".product__item").each((_, el) => {
-        const item = $(el);
-        const href = item.find("a[href]").first().attr("href") || "";
-        const epText = (item.find("span[class^=actual-schedule-ep]").text() || "")
-          .replace(/selanjutnya:\s*/i, "")
-          .replace(/\s+/g, " ")
-          .trim();
-        const card = {
-          animeId: idFromAnimeUrl(href) || href,
-          title: item.find(".product__item__text h5 a").first().text().trim(),
-          poster: item.find(".product__item__pic").attr("data-setbg") || "",
-          episode: epText || (item.find(".ep").text() || "").replace(/\s+/g, " ").trim(),
-          day,
-          status: normalizeStatus(item.find(".d-none span").first().text().trim()),
-          genres: [],
-        };
-        if (card.title) list.push(card);
-      });
-      groups[day] = list;
-    })
-  );
-
-  return DAY_ORDER.filter((d) => groups[d] && groups[d].length).map((day) => ({
-    day,
-    anime_list: groups[day],
+  const d = await cached("schedule", 10 * 60 * 1000, () => apiGet("jadwal.php"));
+  const days = Array.isArray(d.data) ? d.data : [];
+  return days.map((day) => ({
+    day: String(day.day || "").toLowerCase(),
+    date: day.date || null,
+    date_ts: day.date_ts || null,
+    anime_list: (Array.isArray(day.animeList) ? day.animeList : []).map((a) => ({
+      animeId: normalizeSlug(a.link) || a.id,
+      title: a.anime_name,
+      poster: a.cover || "",
+      episode: null,
+      day: String(day.day || "").toLowerCase(),
+      status: null,
+      updated: a.updated || null,
+      genres: [],
+    })),
   }));
 }
 
+const GENRES = [
+  ["Action", "action"], ["Adventure", "adventure"], ["Comedy", "comedy"],
+  ["Dementia", "dementia"], ["Demons", "demons"], ["Drama", "drama"], ["Ecchi", "ecchi"],
+  ["Fantasy", "fantasy"], ["Game", "game"], ["Harem", "harem"],
+  ["Historical", "historical"], ["Horror", "horror"], ["Isekai", "isekai"], ["Josei", "josei"],
+  ["Kids", "kids"], ["Magic", "magic"], ["Martial Arts", "martial-arts"], ["Mecha", "mecha"],
+  ["Military", "military"], ["Music", "music"], ["Mystery", "mystery"], ["Psychological", "psychological"],
+  ["Romance", "romance"], ["Samurai", "samurai"], ["School", "school"], ["Sci-Fi", "sci-fi"],
+  ["Seinen", "seinen"], ["Shoujo", "shoujo"], ["Shounen", "shounen"],
+  ["Space", "space"], ["Sports", "sports"], ["Supernatural", "supernatural"],
+  ["Thriller", "thriller"], ["Vampire", "vampire"],
+];
+
 async function genres() {
-  const r = await client.get("/");
-  const $ = require("cheerio").load(r.text);
-  const seen = new Set();
-  const out = [];
-  $('a[href*="/properties/genre/"]').each((_, a) => {
-    const el = $(a);
-    const title = el.text().trim();
-    const href = el.attr("href") || "";
-    const endpoint = href.split("/").filter(Boolean).pop();
-    if (title && endpoint && !seen.has(endpoint)) {
-      seen.add(endpoint);
-      out.push({ title, endpoint });
-    }
-  });
-  return out;
+  return GENRES.map(([title, endpoint]) => ({ title, endpoint }));
 }
 
-function listOf(d) {
+function listOf(type, page, items, total) {
   return {
-    type: d.type,
-    page: d.page,
-    animeList: (d.items || []).map(cardToTsuki),
-    pagination: d.pagination,
-    has_next: d.has_next,
-    next_page: d.next_page,
+    type,
+    page,
+    animeList: items,
+    pagination: null,
+    has_next: total > page * 30,
+    next_page: total > page * 30 ? page + 1 : null,
   };
 }
 
 async function ongoing(page = 1) {
-  return listOf(await scraper.getList("ongoing", page));
+  return statusList("ongoing", page);
 }
 
 async function complete(page = 1) {
-  return listOf(await scraper.getList("finished", page));
+  return statusList("completed", page);
 }
 
 async function listByType(type, page = 1) {
-  return listOf(await scraper.getList(type, page));
+  if (type === "movie") {
+    const d = await cached("movie", 10 * 60 * 1000, () => apiGet("movie.php"));
+    const items = (Array.isArray(d) ? d : []).map(cardFromList);
+    return listOf("movie", page, items, items.length);
+  }
+  const d = await cached(`animeList:${page}`, 15 * 60 * 1000, () =>
+    apiGet("anime-list.php", { page })
+  );
+  const flat = Array.isArray(d)
+    ? d
+    : Object.values(d || {}).flat().filter(Boolean);
+  const start = (page - 1) * 30;
+
+  if (type === "donghua") {
+    const items = flat
+      .filter((x) => {
+        const slug = normalizeSlug(x.url || x.link || x.id);
+        return String(STATUS[slug]?.type || "").toLowerCase() === "donghua";
+      })
+      .map(cardFromList);
+    return listOf("donghua", page, items.slice(start, start + 30), items.length);
+  }
+
+  if (type === "upcoming") {
+    const items = flat
+      .filter((x) => {
+        const slug = normalizeSlug(x.url || x.link || x.id);
+        const s = STATUS[slug]?.s || "";
+        return /UPCOMING|PENGUMUMAN/i.test(s);
+      })
+      .map(cardFromList);
+    return listOf("upcoming", page, items.slice(start, start + 30), items.length);
+  }
+
+  if (type === "all") {
+    // Gabungan ongoing + completed + movie + donghua (buang None/Pengumuman),
+    // diacak deterministik biar tiap halaman campur rata.
+    const items = flat
+      .filter((x) => {
+        const slug = normalizeSlug(x.url || x.link || x.id);
+        const t = String(STATUS[slug]?.type || "").toLowerCase();
+        const s = String(STATUS[slug]?.s || "");
+        return t && t !== "none" && !/PENGUMUMAN/i.test(s);
+      })
+      .sort((a, b) => {
+        const ha = hash32(normalizeSlug(a.url || a.link || a.id));
+        const hb = hash32(normalizeSlug(b.url || b.link || b.id));
+        return ha - hb;
+      })
+      .map(cardFromList);
+    return listOf("all", page, items.slice(start, start + 30), items.length);
+  }
+
+  return listOf(type, page, flat.slice(start, start + 30).map(cardFromList), flat.length);
+}
+
+function hash32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
 async function byGenre(slug, page = 1) {
-  const d = await scraper.getProperties("genre", slug, page);
+  const d = await cached(`genre:${slug}:${page}`, 10 * 60 * 1000, () =>
+    apiGet("genreseries.php", { url: slug, page })
+  );
+  const items = (Array.isArray(d) ? d : []).map((c) => ({
+    ...cardFromList(c),
+    genres: Array.isArray(c.genre) ? c.genre : [],
+  }));
   return {
     genre: slug,
     page,
-    genreList: (d.items || []).map(cardToTsuki),
-    animeList: (d.items || []).map(cardToTsuki),
+    genreList: items,
+    animeList: items,
+    has_next: items.length >= 25,
+    next_page: items.length >= 25 ? page + 1 : null,
   };
 }
 
 async function searchQuery(q) {
-  const results = await scraper.search(q, 30);
-  const animeList = results.map((r) => ({
-    animeId: idFromAnimeUrl(r.url) || r.url,
-    title: r.title,
-    poster: r.poster,
-    genres: [],
+  const d = await cached(`search:${q}`, 10 * 60 * 1000, () =>
+    apiGet("search.php", { keyword: q })
+  );
+  const result = Array.isArray(d.data) ? d.data[0] : null;
+  const items = ((result && result.result) || []).map((c) => ({
+    ...cardFromList(c),
+    genres: Array.isArray(c.genre) ? c.genre : [],
+    synopsis: c.sinopsis || null,
   }));
-  return { query: q, animeList, results };
+  return { query: q, animeList: items, results: items };
 }
 
-function serverRef(serverId, animeId, slug, ep) {
-  return `${serverId}:${animeId}:${slug}:${ep}`;
+function formatSize(kb) {
+  const n = Number(kb);
+  if (!n || n <= 0) return null;
+  if (n >= 1048576) return `${(n / 1048576).toFixed(2)} GB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} MB`;
+  return `${Math.round(n)} KB`;
 }
 
-function parseServerRef(ref) {
-  const parts = String(ref || "").split(":");
-  if (parts.length < 4) return null;
-  const [serverId, animeId, slug, ep] = parts;
-  return { serverId, animeId, slug, ep };
+function qualityFromStreams(streams, resoSize) {
+  const groups = new Map();
+  for (const reso of Object.keys(streams || {})) {
+    const links = Array.isArray(streams[reso]) ? streams[reso] : [];
+    for (const s of links) {
+      if (!s.link) continue;
+      const label = s.reso || reso;
+      if (!groups.has(label)) groups.set(label, []);
+      const fallback = resoSize && (resoSize[label] || resoSize[reso]);
+      groups.get(label).push({
+        url: s.link,
+        quality: label,
+        size: formatSize(s.size_kb) || (typeof fallback === "string" ? fallback : null),
+      });
+    }
+  }
+  const qualities = [];
+  for (const [label, links] of groups) {
+    qualities.push({
+      title: label,
+      serverList: links.map((l, i) => ({
+        title: links.length > 1 ? `Mirror ${i + 1}` : label,
+        url: l.url,
+        quality: l.quality,
+        size: l.size,
+      })),
+    });
+  }
+  return qualities.sort((a, b) => {
+    const ra = parseInt(String(a.title), 10) || 0;
+    const rb = parseInt(String(b.title), 10) || 0;
+    return rb - ra;
+  });
 }
 
 async function episode(slug) {
-  let ref = parseEpisodeRef(slug);
-  if (!ref) {
-    const m = String(slug).match(/^(\d+)-(\d+)$/);
-    if (m) ref = { id: m[1], slug: null, ep: m[2] };
-  }
-  if (!ref) throw new Error(`referensi episode tidak valid: ${slug}`);
+  const epUrl = normalizeSlug(slug);
+  const data = await getEpisodeData(epUrl);
+  if (!data || !data.streams) throw new Error(`episode tidak ditemukan: ${epUrl}`);
+  const qualities = qualityFromStreams(data.streams, data.resoSize);
+  const verified = await verifyStreams(qualities);
+  const direct = verified.length ? verified[0].serverList[0].url : null;
+  return {
+    episodeId: epUrl,
+    title: `Episode ${epUrl}`,
+    animeTitle: null,
+    defaultStreamingUrl: direct,
+    streamUrl: direct,
+    server: { qualities: verified },
+    servers: [],
+  };
+}
 
-  let { id, slug: eSlug, ep } = ref;
-  if (!eSlug) {
-    const r = await client.get(`/anime/${id}`);
-    const m = r.url.match(/\/anime\/(\d+)\/([^/?#]+)/);
-    if (!m) throw new Error(`slug episode tidak ditemukan untuk anime ${id}`);
-    id = m[1];
-    eSlug = m[2];
-  }
+const HEAD_TIMEOUT = 4000;
 
-  const key = `/anime/${id}/${eSlug}/episode/${ep}`;
-  return cached(key, 30 * 60 * 1000, async () => {
-    const d = await scraper.getEpisode(id, eSlug, ep);
-    const servers = d.servers || [];
-    const preferred =
-      servers.find((s) => /kuramadrive/i.test(s.id)) || servers[0] || null;
-
-    const qualities = [];
-    let defaultStreamingUrl;
-
-    if (preferred) {
-      try {
-        const st = await stream.getStream(id, eSlug, ep, preferred.id, true);
-        if (st.type === "mp4" && Array.isArray(st.sources) && st.sources.length) {
-          for (const src of st.sources) {
-            qualities.push({
-              title: src.quality || "SD",
-              serverList: [
-                { title: preferred.name || preferred.id, url: src.url, quality: src.quality },
-              ],
-            });
-            if (src.url && !/r2\.cloudflarestorage\.com/.test(src.url)) {
-              moov.prefetch(src.url);
-            }
-          }
-          defaultStreamingUrl = st.stream_url;
-        } else if (st.type === "mp4" && st.stream_url) {
-          qualities.push({
-            title: "Default",
-            serverList: [{ title: preferred.name || preferred.id, url: st.stream_url }],
-          });
-          defaultStreamingUrl = st.stream_url;
-        }
-      } catch (_) {
-        /* preferred server gagal resolve; fallback ke lazy list */
-      }
-    }
-
-    const lazyServers = servers
-      .filter((s) => !preferred || s.id !== preferred.id)
-      .map((s) => ({
-        title: s.name || s.id,
-        serverId: serverRef(s.id, id, eSlug, ep),
-      }));
-
-    if (lazyServers.length) {
-      const dg = qualities.find((q) => q.title.toLowerCase() === "default");
-      if (dg) dg.serverList.push(...lazyServers);
-      else qualities.push({ title: "Default", serverList: lazyServers });
-    }
-
-    return {
-      episodeId: `${id}-${ep}`,
-      title: d.title,
-      animeTitle: d.anime_title,
-      defaultStreamingUrl,
-      streamUrl: defaultStreamingUrl,
-      server: { qualities },
-      servers: servers.map((s) => ({
-        title: s.name || s.id,
-        serverId: serverRef(s.id, id, eSlug, ep),
-      })),
-    };
+function headCheck(url) {
+  return new Promise((resolve) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HEAD_TIMEOUT);
+    fetch(url, {
+      method: "HEAD",
+      signal: ctrl.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+        Referer: "https://animekita.org/",
+        Accept: "*/*",
+      },
+    })
+      .then((res) => {
+        clearTimeout(timer);
+        const ct = String(res.headers.get("content-type") || "");
+        const ok = res.ok && ct && !/^application\/json/i.test(ct);
+        resolve(ok);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(false);
+      });
   });
 }
 
-async function server(id) {
-  const ref = parseServerRef(id);
-  if (!ref) throw new Error(`referensi server tidak valid: ${id}`);
-  return cached(id, 10 * 60 * 1000, async () => {
-    const st = await stream.getStream(
-      ref.animeId,
-      ref.slug,
-      ref.ep,
-      ref.serverId,
-      true
-    );
-    if (st.type === "mp4" && st.stream_url) {
-      return {
-        url: st.stream_url,
-        type: "mp4",
-        quality: st.quality,
-        sources: st.sources,
-      };
+async function verifyStreams(qualities) {
+  const jobs = [];
+  for (const q of qualities) {
+    for (const sv of q.serverList) {
+      jobs.push({ q, sv, done: headCheck(sv.url).then((ok) => ({ ok, sv, q })) });
     }
-    return {
-      url: null,
-      error: st.error || `server ${ref.serverId} tidak menyediakan stream mp4`,
-    };
-  });
+  }
+  const results = await Promise.all(jobs.map((j) => j.done));
+  const dead = new Set(results.filter((r) => !r.ok).map((r) => r.sv.url));
+  const out = qualities
+    .map((q) => {
+      const alive = q.serverList.filter((sv) => !dead.has(sv.url));
+      if (alive.length === 0) {
+        // Semua mirror mati: jaga satu supaya Player tetap punya sumber untuk fallback
+        return { ...q, serverList: q.serverList.slice(0, 1) };
+      }
+      return { ...q, serverList: alive };
+    })
+    .filter((q) => q.serverList.length > 0);
+  return out;
 }
 
 module.exports = {
   home,
   animeDetail,
-  animeEpisodePage,
   schedule,
   genres,
   ongoing,
@@ -400,9 +799,22 @@ module.exports = {
   byGenre,
   searchQuery,
   episode,
-  server,
+  recommendations,
+  startCrawler,
+  startPosterCrawler,
+  fullList,
+  verifyCovers,
+  anilistSearchPoster,
+  statusCounts: () => {
+    let ongoing = 0, completed = 0;
+    for (const k of Object.keys(STATUS)) {
+      if (ONGOING_RE.test(STATUS[k].s)) ongoing++;
+      else if (COMPLETED_RE.test(STATUS[k].s)) completed++;
+    }
+    return { known: Object.keys(STATUS).length, ongoing, completed };
+  },
   normalizeStatus,
-  animePathFromUrl,
-  parseRef,
-  parseEpisodeRef,
+  animePathFromUrl: (url) => url,
+  parseRef: (ref) => ({ id: normalizeSlug(ref), slug: normalizeSlug(ref) }),
+  parseEpisodeRef: (ref) => ({ id: null, slug: null, ep: normalizeSlug(ref) }),
 };

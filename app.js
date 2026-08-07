@@ -1,14 +1,31 @@
 const express = require("express");
-const scraper = require("./scraper");
-const stream = require("./stream");
 const adapter = require("./adapter");
+const fs = require("fs");
+const path = require("path");
+
+let adminApp = null;
+function getAdmin() {
+  if (adminApp) return adminApp;
+  const { initializeApp, cert } = require("firebase-admin");
+  const saPath = path.join(__dirname, "service-account.json");
+  if (fs.existsSync(saPath)) {
+    adminApp = initializeApp({ credential: cert(saPath) });
+  } else if (process.env.FIREBASE_SA_B64) {
+    adminApp = initializeApp({
+      credential: cert(JSON.parse(Buffer.from(process.env.FIREBASE_SA_B64, "base64").toString("utf8"))),
+    });
+  } else {
+    throw new Error("service-account.json tidak ada dan FIREBASE_SA_B64 kosong");
+  }
+  return adminApp;
+}
 
 const app = express();
 
 app.set("trust proxy", true);
 
 const RATE_WINDOW_MS = 60 * 1000;
-const RATE_MAX = 90;
+const RATE_MAX = 300;
 const rateBuckets = new Map();
 
 function rateLimit(req, res, next) {
@@ -33,41 +50,38 @@ setInterval(() => {
 
 app.use(rateLimit);
 
+app.use(express.json({ limit: "8mb" }));
+
 app.use((req, res, next) => {
   res.set({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With, Range",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With, Range, Authorization",
   });
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-const VALID_LISTS = ["ongoing", "finished", "upcoming", "movie", "donghua", "anime"];
+const VALID_LISTS = ["all", "ongoing", "finished", "upcoming", "movie", "donghua", "anime"];
 
 app.get("/", (_req, res) => {
   res.json({
-    name: "Kuramanime Scraper API (Node.js) - TsukiNime compatible",
-    version: "2.0.0",
-    tsukinime_endpoints: {
-      "GET /home": "homepage (recent + ongoing + completed)",
-      "GET /anime/{animeId}": "anime detail + episodeList",
+    name: "TsukiNime Scraper API",
+    version: "3.0.0",
+    source: "https://apps.animekita.org/api/v1.2.5",
+    endpoints: {
+      "GET /home": "homepage (recent + ongoing + completed + film)",
+      "GET /recommendations?limit=12": "rekomendasi acak",
+      "GET /anime/{slug}": "anime detail + episodeList",
       "GET /episode/{episodeId}": "episode servers + qualities",
-      "GET /server/{serverId}": "resolve stream url mp4",
       "GET /schedule": "jadwal mingguan by hari",
       "GET /genres": "daftar genre",
       "GET /genre/{slug}?page=1": "anime by genre",
       "GET /search/{q}": "pencarian",
       "GET /ongoing-anime?page=1": "anime ongoing",
       "GET /complete-anime?page=1": "anime selesai",
-    },
-    legacy_endpoints: {
-      "GET /list?type=ongoing&page=1": "anime list",
-      "GET /properties/{property}/{value}?page=1": "filter by genre/season/type/quality",
-      "GET /search?q=one+piece": "quick search",
-      "GET /anime/{id}/{slug}": "anime detail raw",
-      "GET /episode/{id}/{slug}/{ep}": "episode page raw",
-      "GET /stream/{id}/{slug}/{ep}?server=kuramadrive&block_non_mp4=false": "stream url",
+      "GET /list/{type}?page=1": "type: ongoing|finished|upcoming|movie|donghua|anime",
+      "GET /proxy?url=...": "proxy video mp4",
     },
   });
 });
@@ -81,7 +95,138 @@ const wrap = (fn) => (req, res) => {
 
 app.get("/home", wrap(() => adapter.home()));
 
+// trigger notif tes manual: POST /push-test?key=tsukitest
+app.post("/push-test", async (req, res) => {
+  if (req.query.key !== "tsukitest") return res.status(403).json({ error: "key salah" });
+  try {
+    const { getFirestore } = require("firebase-admin/firestore");
+    const { getMessaging } = require("firebase-admin/messaging");
+    const adm = getAdmin();
+    const users = await getFirestore(adm).collection("users").get();
+    const tokens = users.docs.flatMap((d) => (Array.isArray(d.data().fcmTokens) ? d.data().fcmTokens : []));
+    if (tokens.length === 0) return res.json({ sent: 0, reason: "belum ada token FCM" });
+    const r = await getMessaging(adm).sendEachForMulticast({
+      tokens,
+      notification: { title: "TsukiNime", body: "Notifikasi push jalan! 🔔" },
+      android: { priority: "high", notification: { channelId: "episode_rilis" } },
+      data: { test: "1" },
+    });
+    res.json({ sent: r.successCount, failed: r.failureCount, tokens: tokens.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/recommendations", wrap((req) => {
+  const limit = parseInt(req.query.limit, 10) || 12;
+  return adapter.recommendations(limit);
+}));
+
 app.get("/schedule", wrap(() => adapter.schedule()));
+
+// baca announcements (publik) — dipakai dashboard & banner
+app.get("/announcements", wrap(async () => {
+  const snap = await adminFs(getAdmin()).collection("announcements").orderBy("createdAt", "desc").limit(20).get();
+  const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  items.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+  return items;
+}));
+
+// ---------- ADMIN: kelola announcements (token diverifikasi + cek role) ----------
+const { getAuth } = require("firebase-admin/auth");
+const { getFirestore: adminFs } = require("firebase-admin/firestore");
+const { FieldValue } = require("firebase-admin/firestore");
+
+async function requireAdmin(req, res, next) {
+  try {
+    const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+    if (!token) return res.status(401).json({ error: "token dibutuhkan" });
+    const decoded = await getAuth(getAdmin()).verifyIdToken(token);
+    const snap = await adminFs(getAdmin()).collection("users").doc(decoded.uid).get();
+    if (snap.data()?.role !== "admin") return res.status(403).json({ error: "bukan admin" });
+    req.adminUid = decoded.uid;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: "token tidak valid: " + e.message });
+  }
+}
+
+// simpan / edit: POST /admin/announcement  { id?, title, message, animeId?, pinned }
+app.post("/admin/announcement", requireAdmin, async (req, res) => {
+  const { id, title, message, animeId, pinned } = req.body || {};
+  if (!title || !message) return res.status(400).json({ error: "judul & pesan wajib" });
+  const payload = {
+    title: String(title).trim(),
+    message: String(message).trim(),
+    animeId: animeId ? String(animeId).trim() : null,
+    pinned: !!pinned,
+  };
+  const col = adminFs(getAdmin()).collection("announcements");
+  if (id) {
+    await col.doc(id).update(payload);
+  } else {
+    await col.add({ ...payload, createdAt: FieldValue.serverTimestamp() });
+  }
+  res.json({ ok: true, id: id || null });
+});
+
+// hapus: POST /admin/announcement/delete  { id }
+app.post("/admin/announcement/delete", requireAdmin, async (req, res) => {
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error: "id wajib" });
+  await adminFs(getAdmin()).collection("announcements").doc(id).delete();
+  res.json({ ok: true });
+});
+
+// ---------- UPLOAD FOTO PROFIL (base64 -> catbox.moe, server-side, bebas CORS) ----------
+
+async function requireAuth(req, res, next) {
+  try {
+    const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+    if (!token) return res.status(401).json({ error: "token dibutuhkan" });
+    const decoded = await getAuth(getAdmin()).verifyIdToken(token);
+    req.uid = decoded.uid;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: "token tidak valid: " + e.message });
+  }
+}
+
+app.post("/upload", requireAuth, async (req, res) => {
+  const { image } = req.body || {};
+  if (!image || typeof image !== "string") {
+    return res.status(400).json({ error: "data image base64 wajib" });
+  }
+  const b64 = image.replace(/^data:image\/[a-zA-Z+]+;base64,/, "");
+  if (b64.length > 6 * 1024 * 1024) {
+    return res.status(400).json({ error: "ukuran foto terlalu besar (maks 6MB)" });
+  }
+  console.log(`[upload] uid=${req.uid} bytes=${Math.floor(b64.length * 0.75)}`);
+  try {
+    const form = new FormData();
+    form.append("reqtype", "fileupload");
+    form.append(
+      "fileToUpload",
+      new Blob([Buffer.from(b64, "base64")], { type: "image/png" }),
+      "pfp.png"
+    );
+    const r = await fetch("https://catbox.moe/user/api.php", {
+      method: "POST",
+      body: form,
+      headers: { "User-Agent": "TsukiNime/1.0" },
+    });
+    const text = await r.text();
+    if (!r.ok || !/^https?:\/\//.test(text.trim())) {
+      console.log(`[upload] gagal: HTTP ${r.status} ${text.slice(0, 120)}`);
+      return res.status(502).json({ error: "upload gagal: " + text.slice(0, 120) });
+    }
+    console.log(`[upload] sukses: ${text.trim().slice(0, 60)}`);
+    res.json({ url: text.trim() });
+  } catch (e) {
+    console.log(`[upload] error: ${e.message}`);
+    res.status(502).json({ error: "upload gagal: " + e.message });
+  }
+});
 
 app.get("/genres", wrap(() => adapter.genres()));
 
@@ -110,14 +255,10 @@ app.get("/list/:type", wrap((req) => {
     err.status = 400;
     throw err;
   }
+  if (type === "ongoing") return adapter.ongoing(page);
+  if (type === "finished") return adapter.complete(page);
   return adapter.listByType(type, page);
 }));
-
-app.get("/server/:serverId", wrap((req) => adapter.server(req.params.serverId)));
-
-app.get("/episode/:animeId/:slug/:ep", wrap((req) =>
-  scraper.getEpisode(req.params.animeId, req.params.slug, req.params.ep)
-));
 
 app.get("/episode/*splat", wrap((req) => {
   const s = req.params.splat;
@@ -125,68 +266,15 @@ app.get("/episode/*splat", wrap((req) => {
   return adapter.episode(path);
 }));
 
-app.get("/list", wrap((req) => {
-  const type = req.query.type || "ongoing";
-  const page = parseInt(req.query.page, 10) || 1;
-  const orderBy = req.query.order_by || "updated";
-  if (!VALID_LISTS.includes(type)) {
-    const err = new Error(`type harus salah satu dari ${[...VALID_LISTS].sort().join(", ")}`);
-    err.status = 400;
-    throw err;
-  }
-  return scraper.getList(type, page, orderBy);
-}));
-
-app.get("/properties/:prop/:value", wrap((req) => {
-  const page = parseInt(req.query.page, 10) || 1;
-  const orderBy = req.query.order_by || "updated";
-  return scraper.getProperties(req.params.prop, req.params.value, page, orderBy);
-}));
-
-app.get("/search", wrap((req) => {
-  const q = req.query.q || req.query.keyword;
-  if (!q) {
-    const err = new Error("parameter q wajib diisi");
-    err.status = 400;
-    throw err;
-  }
-  return scraper.search(q).then((results) => ({ keyword: q, results }));
-}));
-
-app.get("/episodes/*splat", wrap((req) => {
-  const s = req.params.splat;
-  const path = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
-  const page = Math.max(1, parseInt(req.query.page || "1", 10));
-  return adapter.animeEpisodePage(path, page);
-}));
-
-app.get("/anime/:animeId/:slug", wrap((req) =>
-  scraper.getDetail(req.params.animeId, req.params.slug)
-));
-
 app.get("/anime/*splat", wrap((req) => {
   const s = req.params.splat;
   const path = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
   return adapter.animeDetail(path);
 }));
 
-app.get("/stream/:animeId/:slug/:ep", wrap((req) => {
-  const server = req.query.server || "kuramadrive";
-  const blockNonMp4 = !["0", "false", "no"].includes(
-    String(req.query.block_non_mp4 || "true").toLowerCase()
-  );
-  return stream.getStream(
-    req.params.animeId,
-    req.params.slug,
-    req.params.ep,
-    server,
-    blockNonMp4
-  );
-}));
-
 const { Readable } = require("stream");
 const moov = require("./moov");
-const PROXY_ALLOWED = /(^|\.)(my\.id|kuramanime\.(ink|ing|id))$|\.cloudfront\.net$/i;
+const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link)$/i;
 
 app.get("/proxy", async (req, res) => {
   const raw = req.query.url;
@@ -242,7 +330,7 @@ app.get("/proxy", async (req, res) => {
   const headers = {
     "User-Agent":
       "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
-    "Referer": "https://v17.kuramanime.ink/",
+    "Referer": "https://animekita.org/",
     "Accept": "*/*",
   };
   if (req.headers.range) headers["Range"] = req.headers.range;
@@ -281,5 +369,9 @@ app.use((err, _req, res, _next) => {
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Kuramanime API on http://0.0.0.0:${PORT}`);
+  console.log(`TsukiNime API on http://0.0.0.0:${PORT}`);
 });
+if (process.env.NO_CRAWL !== "1") {
+  adapter.startCrawler();
+  adapter.startPosterCrawler();
+}

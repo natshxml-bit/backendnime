@@ -15,7 +15,7 @@ function prefetch(url) {
       headers: {
         Range: `bytes=0-${MOOV_PRELOAD - 1}`,
         "User-Agent": UA,
-        Referer: "https://v17.kuramanime.ink/",
+        Referer: "https://animekita.org/",
         Accept: "*/*",
       },
       redirect: "follow",
