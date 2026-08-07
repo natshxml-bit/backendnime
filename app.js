@@ -297,7 +297,7 @@ app.get("/anime/*splat", wrap((req) => {
 
 const { Readable } = require("stream");
 const moov = require("./moov");
-const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link)$/i;
+const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;
 
 app.get("/proxy", async (req, res) => {
   const raw = req.query.url;
