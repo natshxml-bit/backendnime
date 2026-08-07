@@ -36,6 +36,19 @@ function acquireLock() {
     return true;
   } catch {
     try {
+      // cek PID di lock masih hidup (kalau mati, langsung ambil alih tanpa nunggu stale)
+      const pid = parseInt(String(fs.readFileSync(LOCK_FILE, "utf8")).trim(), 10);
+      if (pid > 0 && Number.isInteger(pid)) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          fs.writeFileSync(LOCK_FILE, String(process.pid));
+          console.log("[watcher] lock dari PID mati diambil alih");
+          return true;
+        }
+      }
+    } catch {}
+    try {
       const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
       if (age > 5 * 60 * 1000) {
         fs.writeFileSync(LOCK_FILE, String(process.pid));
@@ -44,8 +57,16 @@ function acquireLock() {
       }
     } catch {}
     console.error("[watcher] watcher lain sudah berjalan — keluar.");
-    process.exit(1);
+    return false;
   }
+}
+
+function releaseLock() {
+  try {
+    if (String(fs.readFileSync(LOCK_FILE, "utf8")).trim() === String(process.pid)) {
+      fs.unlinkSync(LOCK_FILE);
+    }
+  } catch {}
 }
 
 const cred = loadCredential();
@@ -54,7 +75,12 @@ if (!cred) {
   process.exit(1);
 }
 
-if (!acquireLock()) process.exit(1);
+if (!acquireLock()) process.exit(0);
+
+// bersihkan lock saat proses dimatikan supaya restart berikutnya tidak salah deteksi watcher ganda
+process.on("exit", releaseLock);
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));
 
 initializeApp(cred);
 const db = getFirestore();
