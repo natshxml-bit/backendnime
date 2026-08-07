@@ -10,8 +10,8 @@ const SERVICE_ACCOUNT = path.join(__dirname, "service-account.json");
 const SNAPSHOT_FILE = path.join(__dirname, "data", "lastEpisodes.json");
 const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
-const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "30", 10) * 60 * 1000;
-const COOLDOWN_MS = 20 * 60 * 1000;
+const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "15", 10) * 60 * 1000;
+const COOLDOWN_MS = 10 * 60 * 1000;
 const DAILY_CAP_PER_ANIME = 4;
 
 function loadCredential() {
@@ -203,7 +203,7 @@ async function tick() {
       const ep = epNum(anime.episode || anime.episodes || anime.lastEpisode || "");
       const prevMax = maxByAnime[animeId] || 0;
       if (ep !== null && ep > prevMax) {
-        if (prevMax > 0) newEpisodes.push({ anime, ep });
+        if (prevMax > 0 || snapshotLoadedFromRemote) newEpisodes.push({ anime, ep });
         maxByAnime[animeId] = ep;
       } else if (ep !== null) {
         maxByAnime[animeId] = Math.max(prevMax, ep);
