@@ -207,6 +207,7 @@ async function tick() {
   } catch (e) {
     console.error("[watcher] tick error:", e.message);
     await heartbeat(String(e?.message || "error"));
+    throw e;
   }
 }
 
@@ -239,6 +240,23 @@ if (process.argv.includes("--test")) {
   sendTest().then(() => process.exit(0));
 } else {
   console.log(`[watcher] mulai. Polling tiap ${POLL_MS / 60000} menit`);
-  tick();
-  setInterval(tick, POLL_MS);
+  // Retry tick awal dengan backoff — di Railway app.js & watcher.js start barengan,
+  // jadi API bisa belum siap saat tick pertama
+  async function startWithRetry(attempt = 1) {
+    try {
+      await tick();
+      setInterval(tick, POLL_MS);
+      console.log("[watcher] tick pertama sukses, interval terjadwal");
+    } catch (e) {
+      const wait = Math.min(5000 * attempt, 30000);
+      console.log(`[watcher] tick awal gagal (${e.message}), retry dalam ${wait / 1000}s (${attempt}/6)`);
+      if (attempt >= 6) {
+        console.log("[watcher] terlalu banyak gagal, lanjut polling tiap 30 detik");
+        setInterval(tick, 30000);
+        return;
+      }
+      setTimeout(() => startWithRetry(attempt + 1), wait);
+    }
+  }
+  startWithRetry();
 }
