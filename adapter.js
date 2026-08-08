@@ -524,6 +524,7 @@ async function recentDetailed() {
     out.push({
       animeId: slug,
       title: c.judul || c.anime_name || c.name || slug,
+      poster: c.cover || c.thumb || "",
       episode,
     });
   });
