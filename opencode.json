@@ -9,26 +9,114 @@
         "apiKey": "sk-qwen-169904c661aee734dbbcc90fbf9bcd651f42edefd7bb3cb5"
       },
       "models": {
-        "kimi-k3": {
-          "name": "Kimi K3"
+        "auto": {
+          "name": "Auto"
         },
-        "deepseek-v4-pro": {
-          "name": "DeepSeek V4 Pro"
+        "auto-debug": {
+          "name": "Auto Debug"
         },
-        "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash"
+
+        "claude-opus-4.8": {
+          "name": "Claude Opus 4.8"
         },
+        "claude-opus-4.8-b": {
+          "name": "Claude Opus 4.8 B"
+        },
+        "claude-opus-5": {
+          "name": "Claude Opus 5"
+        },
+        "claude-opus-5-b": {
+          "name": "Claude Opus 5 B"
+        },
+
         "claude-sonnet-4.5": {
           "name": "Claude Sonnet 4.5"
         },
         "claude-sonnet-4.5-thinking": {
           "name": "Claude Sonnet 4.5 Thinking"
         },
+        "claude-sonnet-4.6-b": {
+          "name": "Claude Sonnet 4.6 B"
+        },
+        "claude-sonnet-5": {
+          "name": "Claude Sonnet 5"
+        },
+        "claude-sonnet-5-b": {
+          "name": "Claude Sonnet 5 B"
+        },
+
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash"
+        },
+        "deepseek-v4-mod": {
+          "name": "DeepSeek V4 Mod"
+        },
+        "deepseek-v4-pro": {
+          "name": "DeepSeek V4 Pro"
+        },
+
+        "glm-5.2": {
+          "name": "GLM 5.2"
+        },
+
+        "gpt-5.5": {
+          "name": "GPT 5.5"
+        },
+        "gpt-5.6": {
+          "name": "GPT 5.6"
+        },
         "gpt-5.6-luna": {
           "name": "GPT 5.6 Luna"
         },
-        "glm-5.2": {
-          "name": "GLM 5.2"
+        "gpt-5.6-luna-b": {
+          "name": "GPT 5.6 Luna B"
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol"
+        },
+        "gpt-5.6-sol-b": {
+          "name": "GPT 5.6 Sol B"
+        },
+        "gpt-5.6-sol-xhigh": {
+          "name": "GPT 5.6 Sol XHigh"
+        },
+        "gpt-5.6-terra": {
+          "name": "GPT 5.6 Terra"
+        },
+        "gpt-5.6-terra-b": {
+          "name": "GPT 5.6 Terra B"
+        },
+
+        "hy3": {
+          "name": "HY3"
+        },
+
+        "kimi-k2.7-code": {
+          "name": "Kimi K2.7 Code"
+        },
+        "kimi-k2.7-code-highspeed": {
+          "name": "Kimi K2.7 Code Highspeed"
+        },
+        "kimi-k3": {
+          "name": "Kimi K3"
+        },
+
+        "mimo-v2.5-pro": {
+          "name": "Mimo V2.5 Pro"
+        },
+
+        "mistral-large-3-675b-instruct": {
+          "name": "Mistral Large 3 675B Instruct"
+        },
+
+        "qwen3.7-max": {
+          "name": "Qwen 3.7 Max"
+        },
+        "qwen3.8-max": {
+          "name": "Qwen 3.8 Max"
+        },
+        "qwen3.8-max-b": {
+          "name": "Qwen 3.8 Max B"
         }
       }
     }
