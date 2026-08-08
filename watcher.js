@@ -1,5 +1,8 @@
 // watcher.js — pantau episode baru dari API, kirim FCM push + simpan notif in-app
 // jalan: node watcher.js  (opsional: node watcher.js --test utk kirim notif tes)
+// Notif HANYA dikirim untuk anime yang ada di JADWAL RILIS (/schedule) dan
+// rilisnya sesuai jadwal (hari rilis / updated terbaru) — bukan asal lihat
+// "latest episode" di feed (itu bisa re-upload/backlog → notif gak akurat).
 const { initializeApp, cert } = require("firebase-admin");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
@@ -10,7 +13,7 @@ const SERVICE_ACCOUNT = path.join(__dirname, "service-account.json");
 const SNAPSHOT_FILE = path.join(__dirname, "data", "lastEpisodes.json");
 const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
-const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "15", 10) * 60 * 1000;
+const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "10", 10) * 60 * 1000;
 const COOLDOWN_MS = 10 * 60 * 1000;
 
 function loadCredential() {
@@ -75,12 +78,20 @@ if (!cred) {
   process.exit(1);
 }
 
-if (!acquireLock()) process.exit(0);
+// mode test tidak perlu lock — biar bisa dijalankan saat watcher utama jalan
+const isTestMode =
+  process.argv.includes("--test") ||
+  process.argv.includes("--test-eps") ||
+  process.argv.some((a) => a.startsWith("--test-anime="));
 
-// bersihkan lock saat proses dimatikan supaya restart berikutnya tidak salah deteksi watcher ganda
-process.on("exit", releaseLock);
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+if (!isTestMode) {
+  if (!acquireLock()) process.exit(0);
+
+  // bersihkan lock saat proses dimatikan supaya restart berikutnya tidak salah deteksi watcher ganda
+  process.on("exit", releaseLock);
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+}
 
 initializeApp(cred);
 const db = getFirestore();
@@ -122,6 +133,54 @@ function cleanTitle(t) {
 function epNum(e) {
   const m = String(e || "").match(/\d+/);
   return m ? parseInt(m[0], 10) : null;
+}
+
+// nama hari WIB (UTC+7) — jadwal.php pakai hari Indonesia & zona WIB,
+// jadi hitung lewat getUTCDay biar konsisten di server zona apapun.
+function wibDayName() {
+  const names = ["minggu", "senin", "selasa", "rabu", "kamis", "jumat", "sabtu"];
+  return names[new Date(Date.now() + 7 * 3600 * 1000).getUTCDay()];
+}
+
+// map animeId -> { day, title, poster, updated } dari /schedule.
+// return null kalau gagal (biar watcher fallback ke perilaku lama).
+async function getScheduleMap() {
+  try {
+    const res = await fetch(`${API_BASE}/schedule`, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) throw new Error(`schedule ${res.status}`);
+    const days = await res.json();
+    if (!Array.isArray(days)) throw new Error("schedule bukan array");
+    const map = {};
+    for (const day of days) {
+      for (const a of Array.isArray(day.anime_list) ? day.anime_list : []) {
+        if (a && a.animeId) {
+          map[a.animeId] = {
+            day: day.day,
+            title: a.title,
+            poster: a.poster || "",
+            updated: a.updated || null,
+          };
+        }
+      }
+    }
+    return map;
+  } catch (e) {
+    console.error("[watcher] gagal muat jadwal rilis:", e.message);
+    return null;
+  }
+}
+
+// Notif hanya kalau judulnya ADA di jadwal rilis DAN rilisnya cocok jadwal:
+// hari rilisnya = hari ini WIB, ATAU jadwal mencatat updated < 48 jam lalu
+// (antisipasi upload telat 1 hari). Kalau jadwal gagal dimuat (null) →
+// fallback biar notif tetap jalan.
+function isScheduledRelease(animeId, scheduleMap) {
+  if (!scheduleMap) return true;
+  const sched = scheduleMap[animeId];
+  if (!sched) return false;
+  const dayMatch = sched.day === wibDayName();
+  const updatedRecent = sched.updated && Date.now() - sched.updated * 1000 < 48 * 3600 * 1000;
+  return dayMatch || updatedRecent;
 }
 
 async function getRecent() {
@@ -224,6 +283,7 @@ async function tick() {
     const users = await getAllUsers();
     const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
     const now = Date.now();
+    const scheduleMap = await getScheduleMap();
     const newEpisodes = [];
 
     for (const anime of recent) {
@@ -232,7 +292,13 @@ async function tick() {
       const ep = epNum(anime.episode || anime.episodes || anime.lastEpisode || "");
       const prevMax = maxByAnime[animeId] || 0;
       if (ep !== null && ep > prevMax) {
-        if (prevMax > 0 || snapshotLoadedFromRemote) newEpisodes.push({ anime, ep });
+        if (prevMax > 0 || snapshotLoadedFromRemote) {
+          if (isScheduledRelease(animeId, scheduleMap)) {
+            newEpisodes.push({ anime, ep });
+          } else {
+            console.log(`[watcher] dilewati (tidak sesuai jadwal rilis): ${cleanTitle(anime.title)} EP ${ep}`);
+          }
+        }
         maxByAnime[animeId] = ep;
       } else if (ep !== null) {
         maxByAnime[animeId] = Math.max(prevMax, ep);
@@ -303,7 +369,48 @@ async function sendTestLastEps() {
   console.log("[watcher] --test-eps selesai (FCM + notif in-app terkirim)");
 }
 
-if (process.argv.includes("--test-eps")) {
+// tes notif anime spesifik: ambil detail dari API, cek gate jadwal, lalu
+// kirim lewat jalur notifyEpisode penuh. Nggak butuh lock, jadi bisa
+// dijalankan walau watcher utama sedang jalan.
+async function sendTestAnime(slug) {
+  const users = await getAllUsers();
+  const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+  const scheduleMap = await getScheduleMap();
+  const sched = scheduleMap?.[slug];
+  let detail = {};
+  try {
+    const res = await fetch(`${API_BASE}/anime/${slug}`, { signal: AbortSignal.timeout(30000) });
+    if (res.ok) detail = await res.json();
+  } catch {}
+  const title = cleanTitle(detail.title || sched?.title || slug);
+  const poster = detail.poster || sched?.poster || "";
+  const ep = Number(detail.totalEpisodes || 0);
+
+  console.log(`[watcher] --test-anime=${slug}`);
+  console.log(`  judul    : ${title}`);
+  console.log(`  episode  : ${ep}`);
+  console.log(`  jadwal   : ${sched ? sched.day + " (hari ini: " + wibDayName() + ")" : "TIDAK ADA di jadwal"}`);
+
+  if (!sched) {
+    return console.log("  → DILEWATI: tidak ada di jadwal rilis (sama seperti watcher biasa)");
+  }
+  if (!isScheduledRelease(slug, scheduleMap)) {
+    return console.log("  → DILEWATI: rilis tidak sesuai jadwal (hari beda / updated lama)");
+  }
+  console.log(`  gate     : PASS → kirim notif (${users.length} user, ${tokens.length} token)`);
+  await notifyEpisode({ animeId: slug, title, poster }, ep || 1, users, tokens);
+  console.log("  selesai (FCM + notif in-app terkirim)");
+}
+
+const testAnimeArg = process.argv.find((a) => a.startsWith("--test-anime="));
+if (testAnimeArg) {
+  const slug = testAnimeArg.split("=")[1];
+  if (!slug) {
+    console.log("[watcher] pakai: node watcher.js --test-anime=<slug> (contoh: --test-anime=mao-sub-indo)");
+    process.exit(1);
+  }
+  sendTestAnime(slug).then(() => process.exit(0));
+} else if (process.argv.includes("--test-eps")) {
   sendTestLastEps().then(() => process.exit(0));
 } else if (process.argv.includes("--test")) {
   sendTest().then(() => process.exit(0));
