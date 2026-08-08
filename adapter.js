@@ -421,7 +421,7 @@ function cardFromList(it) {
     score: null,
     status: st?.s || it.status || null,
     type: st?.type || it.type || null,
-    episode: st?.eps ?? it.lastch ?? it.episode ?? null,
+    episode: it.lastch ?? st?.eps ?? it.episode ?? null,
     quality: null,
     genres: Array.isArray(it.genre) ? it.genre : [],
   };
