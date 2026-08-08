@@ -125,6 +125,15 @@ function epNum(e) {
 }
 
 async function getRecent() {
+  // /watcher-feed: upload terbaru + jumlah episode AKTUAL dari series detail
+  // (kartu baruupload/`home` tidak pernah berisi nomor episode).
+  try {
+    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) return data;
+    }
+  } catch {}
   const res = await fetch(`${API_BASE}/home`, { signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`API ${res.status}`);
   const data = await res.json();

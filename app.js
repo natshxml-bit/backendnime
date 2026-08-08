@@ -87,6 +87,7 @@ app.get("/", (_req, res) => {
       "GET /list/{type}?page=1": "type: ongoing|finished|upcoming|movie|donghua|anime",
       "GET /proxy?url=...": "proxy video mp4",
       "GET /watcher-status": "status watcher (heartbeat dari Firestore)",
+      "GET /watcher-feed": "feed watcher: upload terbaru + jumlah episode aktual",
     },
   });
 });
@@ -111,12 +112,12 @@ app.get("/watcher-status", async (_req, res) => {
 
 const wrap = (fn) => (req, res) => {
   Promise.resolve()
-    .then(() => fn(req))
-    .then((data) => res.json(data))
+    .then(() => fn(req))    .then((data) => res.json(data))
     .catch((e) => res.status(502).json({ error: e.message }));
 };
 
 app.get("/home", wrap(() => adapter.home()));
+app.get("/watcher-feed", wrap(() => adapter.recentDetailed()));
 
 // trigger notif tes manual: POST /push-test?key=tsukitest
 app.post("/push-test", async (req, res) => {

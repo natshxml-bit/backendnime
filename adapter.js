@@ -421,7 +421,7 @@ function cardFromList(it) {
     score: null,
     status: st?.s || it.status || null,
     type: st?.type || it.type || null,
-    episode: it.lastch ?? st?.eps ?? it.episode ?? null,
+    episode: it.lastch || st?.eps || it.episode || null,
     quality: null,
     genres: Array.isArray(it.genre) ? it.genre : [],
   };
@@ -488,6 +488,47 @@ async function home() {
     completed: { animeList: completedList },
     film: { animeList: movieList },
   };
+}
+
+// Feed khusus watcher: kartu baruupload DIENRICH dengan jumlah chapter
+// AKTUAL dari series detail (cache pendek 5 mnt) — kartu baruupload sendiri
+// tidak pernah berisi nomor episode, jadi tanpa ini watcher tidak bisa
+// mendeteksi episode baru sama sekali.
+async function recentDetailed() {
+  const uploads = await cached("home:uploads", 5 * 60 * 1000, () =>
+    apiGet("baruupload.php", { page: 1 })
+  );
+  const items = Array.isArray(uploads) ? uploads : [];
+  const out = [];
+  const jobs = items.map(async (c) => {
+    const slug = normalizeSlug(c.url || c.link || c.id);
+    if (!slug) return;
+    let episode = 0;
+    try {
+      const d = await cached(`watchseries:${slug}`, 5 * 60 * 1000, async () => {
+        let res = await apiGet("series.php", { url: slug });
+        let data = Array.isArray(res.data) ? res.data[0] : null;
+        if (!data || !data.series_id) {
+          res = await apiGet("series.php", { url: `${slug}/` });
+          data = Array.isArray(res.data) ? res.data[0] : null;
+        }
+        if (!data || !data.series_id) throw new Error("series tidak ditemukan");
+        return data;
+      });
+      const chapters = Array.isArray(d.chapter) ? d.chapter : [];
+      for (const ch of chapters) {
+        const m = String(ch.ch || "").match(/\d+/);
+        if (m) episode = Math.max(episode, parseInt(m[0], 10));
+      }
+    } catch {}
+    out.push({
+      animeId: slug,
+      title: c.judul || c.anime_name || c.name || slug,
+      episode,
+    });
+  });
+  await Promise.allSettled(jobs);
+  return out;
 }
 
 async function animeDetail(ref) {
