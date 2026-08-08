@@ -863,4 +863,5 @@ module.exports = {
   animePathFromUrl: (url) => url,
   parseRef: (ref) => ({ id: normalizeSlug(ref), slug: normalizeSlug(ref) }),
   parseEpisodeRef: (ref) => ({ id: null, slug: null, ep: normalizeSlug(ref) }),
+  recentDetailed,
 };
