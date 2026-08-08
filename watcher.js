@@ -286,7 +286,26 @@ async function sendTest() {
   console.log(`[watcher] test terkirim: ${resp.successCount}/${resp.failureCount}`);
 }
 
-if (process.argv.includes("--test")) {
+// test notif episode terakhir ASLI: ambil item teratas dari /watcher-feed
+// (dengan poster + episode aktual), kirim lewat jalur notifyEpisode penuh.
+async function sendTestLastEps() {
+  const users = await getAllUsers();
+  const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+  let feed = [];
+  try {
+    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
+    if (res.ok) feed = await res.json();
+  } catch {}
+  const item = (Array.isArray(feed) ? feed : []).find((x) => x && x.animeId && Number(x.episode) > 0);
+  if (!item) return console.log("[watcher] --test-eps gagal: feed kosong/tanpa episode");
+  console.log(`[watcher] --test-eps: ${cleanTitle(item.title)} EP ${item.episode} (${users.length} user, ${tokens.length} token)`);
+  await notifyEpisode(item, item.episode, users, tokens);
+  console.log("[watcher] --test-eps selesai (FCM + notif in-app terkirim)");
+}
+
+if (process.argv.includes("--test-eps")) {
+  sendTestLastEps().then(() => process.exit(0));
+} else if (process.argv.includes("--test")) {
   sendTest().then(() => process.exit(0));
 } else {
   console.log(`[watcher] mulai. Polling tiap ${POLL_MS / 60000} menit`);
