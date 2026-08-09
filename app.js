@@ -162,8 +162,34 @@ async function localSearch(q) {
   return { query: String(q), animeList, results: animeList, source: "catalog" };
 }
 
+// Feed watcher dari database sendiri: recent upload (baruupload) + jumlah
+// episode aktual dari detail anime yang tersimpan. Mengembalikan bentuk
+// yang sama dengan adapter.recentDetailed(). null kalau DB belum ada data.
+async function recentDetailedFromDb() {
+  const home = await db.get("home");
+  if (!home) return null;
+  const recent = (home.value && Array.isArray(home.value.recent)) ? home.value.recent : [];
+  const out = [];
+  for (const it of recent) {
+    const slug = it.animeId;
+    let episode = it.episode || null;
+    try {
+      const det = await db.get(`anime:${slug}`);
+      if (det && det.value && Array.isArray(det.value.episodeList)) {
+        episode = det.value.episodeList.length;
+      }
+    } catch {}
+    out.push({ animeId: slug, title: it.title, poster: it.poster || "", episode });
+  }
+  return out;
+}
+
 app.get("/home", wrap(() => dbFirst("home", () => adapter.home(), 5 * 60 * 1000)));
-app.get("/watcher-feed", wrap(() => adapter.recentDetailed()));
+app.get("/watcher-feed", wrap(async () => {
+  const dbFeed = await recentDetailedFromDb();
+  if (dbFeed) return dbFeed;
+  return adapter.recentDetailed();
+}));
 
 // trigger notif tes manual: POST /push-test?key=tsukitest
 app.post("/push-test", async (req, res) => {
@@ -510,26 +536,49 @@ if (process.env.NO_CRAWL !== "1") {
 // Auto-sync: isi database sendiri dari animekita secara berkala.
 // HANYA aktif saat AUTO_SYNC_HOURS di-set (>0) — dan hanya boleh dipakai
 // saat backend berjalan di IP rumah/ISP (bukan Railway), karena animekita
-// memblokir IP datacenter. Contoh: AUTO_SYNC_HOURS=6
+// memblokir IP datacenter. Contoh: AUTO_SYNC_HOURS=6 LIGHT_SYNC_MIN=30
+//
+// LIGHT (sering, murah): home + schedule + detail anime yang baru di-upload
+//   → bikin /watcher-feed (sumber deteksi episode baru) selalu segar, jadi
+//   notif episode baru sampai ke HP dalam ≤ LIGHT_SYNC_MIN + 10 mnt.
+// HEAVY (jarang, berat): catalog + semua detail ongoing + episode terbaru.
 if (process.env.AUTO_SYNC_HOURS && parseFloat(process.env.AUTO_SYNC_HOURS) > 0) {
   const { runSync } = require("./db/sync_core");
   const HOURS = parseFloat(process.env.AUTO_SYNC_HOURS);
-  const OPTS = {
+  const LIGHT_MIN = parseFloat(process.env.LIGHT_SYNC_MIN || "30");
+  const LIGHT = {
+    home: true,
+    schedule: true,
+    details: 25,
+    ongoing: 0,
+    syncEpisodes: false,
+    lists: 1,
+    genres: true,
+    genrePages: 0,
+  };
+  const HEAVY = {
     home: true,
     schedule: true,
     catalog: true,
     details: 0,
-    ongoing: 15,
+    ongoing: -1,
     syncEpisodes: true,
-    episodesPer: 2,
-    lists: 2,
+    episodesPer: 3,
+    lists: 3,
     genres: true,
     genrePages: 1,
   };
-  const doSync = () =>
-    runSync(OPTS)
-      .then((s) => console.log("[auto-sync] ok:", JSON.stringify(s.counts)))
-      .catch((e) => console.error("[auto-sync] gagal:", e.message));
-  doSync();
-  setInterval(doSync, HOURS * 60 * 60 * 1000);
+  const label = (n, o) => `[auto-sync:${n}] ok: ${JSON.stringify(o.counts)}`;
+  const runLight = () =>
+    runSync(LIGHT)
+      .then((s) => console.log(label("light", s)))
+      .catch((e) => console.error("[auto-sync:light] gagal:", e.message));
+  const runHeavy = () =>
+    runSync(HEAVY)
+      .then((s) => console.log(label("heavy", s)))
+      .catch((e) => console.error("[auto-sync:heavy] gagal:", e.message));
+  runHeavy();
+  setTimeout(runLight, 10_000);
+  setInterval(runHeavy, HOURS * 60 * 60 * 1000);
+  setInterval(runLight, LIGHT_MIN * 60 * 1000);
 }
