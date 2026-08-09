@@ -1,5 +1,6 @@
 const express = require("express");
 const adapter = require("./adapter");
+const db = require("./db/db");
 const fs = require("fs");
 const path = require("path");
 
@@ -88,6 +89,7 @@ app.get("/", (_req, res) => {
       "GET /proxy?url=...": "proxy video mp4",
       "GET /watcher-status": "status watcher (heartbeat dari Firestore)",
       "GET /watcher-feed": "feed watcher: upload terbaru + jumlah episode aktual",
+      "GET /db/status": "status database sendiri (counts + last sync)",
     },
   });
 });
@@ -116,7 +118,22 @@ const wrap = (fn) => (req, res) => {
     .catch((e) => res.status(502).json({ error: e.message }));
 };
 
-app.get("/home", wrap(() => adapter.home()));
+// Baca dari database sendiri dulu; kalau basi dan live gagal, tetap
+// layani data lama (resilient terhadap blokir animekita).
+async function dbFirst(key, liveFn, maxAgeMs) {
+  const stored = await db.get(key);
+  if (stored && Date.now() - stored.updatedAt <= maxAgeMs) return stored.value;
+  try {
+    const data = await liveFn();
+    await db.set(key, data);
+    return data;
+  } catch (e) {
+    if (stored) return stored.value;
+    throw e;
+  }
+}
+
+app.get("/home", wrap(() => dbFirst("home", () => adapter.home(), 5 * 60 * 1000)));
 app.get("/watcher-feed", wrap(() => adapter.recentDetailed()));
 
 // trigger notif tes manual: POST /push-test?key=tsukitest
@@ -146,7 +163,7 @@ app.get("/recommendations", wrap((req) => {
   return adapter.recommendations(limit);
 }));
 
-app.get("/schedule", wrap(() => adapter.schedule()));
+app.get("/schedule", wrap(() => dbFirst("schedule", () => adapter.schedule(), 10 * 60 * 1000)));
 
 // baca announcements (publik) — dipakai dashboard & banner
 app.get("/announcements", wrap(async () => {
@@ -252,23 +269,23 @@ app.post("/upload", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/genres", wrap(() => adapter.genres()));
+app.get("/genres", wrap(() => dbFirst("genres", () => adapter.genres(), 24 * 60 * 60 * 1000)));
 
 app.get("/genre/:slug", wrap((req) => {
   const page = parseInt(req.query.page, 10) || 1;
-  return adapter.byGenre(req.params.slug, page);
+  return dbFirst(`genre:${req.params.slug}:${page}`, () => adapter.byGenre(req.params.slug, page), 6 * 60 * 60 * 1000);
 }));
 
 app.get("/search/:query", wrap((req) => adapter.searchQuery(req.params.query)));
 
 app.get("/ongoing-anime", wrap((req) => {
   const page = parseInt(req.query.page, 10) || 1;
-  return adapter.ongoing(page);
+  return dbFirst(`list:ongoing:${page}`, () => adapter.ongoing(page), 6 * 60 * 60 * 1000);
 }));
 
 app.get("/complete-anime", wrap((req) => {
   const page = parseInt(req.query.page, 10) || 1;
-  return adapter.complete(page);
+  return dbFirst(`list:finished:${page}`, () => adapter.complete(page), 6 * 60 * 60 * 1000);
 }));
 
 app.get("/list/:type", wrap((req) => {
@@ -279,22 +296,39 @@ app.get("/list/:type", wrap((req) => {
     err.status = 400;
     throw err;
   }
-  if (type === "ongoing") return adapter.ongoing(page);
-  if (type === "finished") return adapter.complete(page);
-  return adapter.listByType(type, page);
+  if (type === "ongoing") return dbFirst(`list:ongoing:${page}`, () => adapter.ongoing(page), 6 * 60 * 60 * 1000);
+  if (type === "finished") return dbFirst(`list:finished:${page}`, () => adapter.complete(page), 6 * 60 * 60 * 1000);
+  return dbFirst(`list:${type}:${page}`, () => adapter.listByType(type, page), 6 * 60 * 60 * 1000);
 }));
 
 app.get("/episode/*splat", wrap((req) => {
   const s = req.params.splat;
-  const path = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
-  return adapter.episode(path);
+  const epPath = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
+  return dbFirst(`ep:${epPath}`, () => adapter.episode(epPath), 12 * 60 * 60 * 1000);
 }));
 
 app.get("/anime/*splat", wrap((req) => {
   const s = req.params.splat;
-  const path = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
-  return adapter.animeDetail(path);
+  const animePath = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
+  return dbFirst(`anime:${animePath}`, () => adapter.animeDetail(animePath), 6 * 60 * 60 * 1000);
 }));
+
+app.get("/db/status", async (_req, res) => {
+  try {
+    const last = await db.get("sync:last");
+    const counts = await db.counts();
+    res.json({
+      mode: db.mode(),
+      dbPath: db.DB_PATH,
+      counts,
+      lastSync: last
+        ? { ...last.value, storedAt: new Date(last.updatedAt).toISOString() }
+        : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 const { Readable } = require("stream");
 const moov = require("./moov");
@@ -391,6 +425,45 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: err.message });
 });
 
+// ---------- RELAY (perantara ke animekita) ----------
+// Dipakai oleh instance backend di Railway (IP datacenter, terblokir
+// animekita) untuk mengambil data live lewat instance yang berjalan di
+// IP rumah/ISP (Termux/PC). Token wajib via header X-Relay-Token.
+// Contoh: GET /relay?path=baruupload.php&page=1
+app.get("/relay", async (req, res) => {
+  try {
+    if (!process.env.RELAY_TOKEN || req.get("x-relay-token") !== process.env.RELAY_TOKEN) {
+      return res.status(403).json({ error: "token relay salah" });
+    }
+    const relayPath = String(req.query.path || "");
+    if (!/^[a-zA-Z0-9_/.-]+\.php$/.test(relayPath)) {
+      return res.status(400).json({ error: "path tidak valid" });
+    }
+    const api = new URL(`${adapter.API_BASE}/${relayPath}`);
+    for (const [k, v] of Object.entries(req.query)) {
+      if (k === "path") continue;
+      if (v != null && v !== "") api.searchParams.set(k, String(v));
+    }
+    const up = await fetch(api.toString(), {
+      headers: { "User-Agent": adapter.UA, Accept: "application/json" },
+    });
+    if (!up.ok) {
+      return res.status(up.status).json({ error: `animekita api ${up.status}: ${relayPath}` });
+    }
+    let text = await up.text();
+    const start = text.search(/[\[{]/);
+    if (start >= 0) {
+      const open = text[start];
+      const close = open === "[" ? "]" : "}";
+      const end = text.lastIndexOf(close);
+      if (end > start) text = text.slice(start, end + 1);
+    }
+    res.json(JSON.parse(text));
+  } catch (e) {
+    res.status(502).json({ error: "relay gagal: " + e.message });
+  }
+});
+
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TsukiNime API on http://0.0.0.0:${PORT}`);
@@ -398,4 +471,29 @@ app.listen(PORT, "0.0.0.0", () => {
 if (process.env.NO_CRAWL !== "1") {
   adapter.startCrawler();
   adapter.startPosterCrawler();
+}
+
+// Auto-sync: isi database sendiri dari animekita secara berkala.
+// HANYA aktif saat AUTO_SYNC_HOURS di-set (>0) — dan hanya boleh dipakai
+// saat backend berjalan di IP rumah/ISP (bukan Railway), karena animekita
+// memblokir IP datacenter. Contoh: AUTO_SYNC_HOURS=6
+if (process.env.AUTO_SYNC_HOURS && parseFloat(process.env.AUTO_SYNC_HOURS) > 0) {
+  const { runSync } = require("./db/sync_core");
+  const HOURS = parseFloat(process.env.AUTO_SYNC_HOURS);
+  const OPTS = {
+    home: true,
+    schedule: true,
+    details: 10,
+    syncEpisodes: true,
+    episodesPer: 2,
+    lists: 2,
+    genres: true,
+    genrePages: 1,
+  };
+  const doSync = () =>
+    runSync(OPTS)
+      .then((s) => console.log("[auto-sync] ok:", JSON.stringify(s.counts)))
+      .catch((e) => console.error("[auto-sync] gagal:", e.message));
+  doSync();
+  setInterval(doSync, HOURS * 60 * 60 * 1000);
 }

@@ -5,3 +5,5 @@ dist/
 build/
 service-account.json
 data/watcher.lock
+data/catalog.db
+data/catalog.db-*

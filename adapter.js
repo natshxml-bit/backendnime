@@ -204,13 +204,25 @@ function cached(key, ttlMs, fn) {
 }
 
 async function apiGet(path, params = {}) {
-  const url = new URL(`${API_BASE}/${path}`);
-  for (const [k, v] of Object.entries(params)) {
-    if (v != null && v !== "") url.searchParams.set(k, String(v));
+  // Bila RELAY_URL di-set (backend di Railway terblokir animekita), semua
+  // fetch live dilewatkan lewat relay yang berjalan di IP rumah/ISP.
+  const headers = { "User-Agent": UA, Accept: "application/json" };
+  let res;
+  if (process.env.RELAY_URL) {
+    const rUrl = new URL(`${process.env.RELAY_URL}/relay`);
+    rUrl.searchParams.set("path", path);
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") rUrl.searchParams.set(k, String(v));
+    }
+    if (process.env.RELAY_TOKEN) headers["X-Relay-Token"] = process.env.RELAY_TOKEN;
+    res = await fetch(rUrl.toString(), { headers });
+  } else {
+    const url = new URL(`${API_BASE}/${path}`);
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") url.searchParams.set(k, String(v));
+    }
+    res = await fetch(url.toString(), { headers });
   }
-  const res = await fetch(url.toString(), {
-    headers: { "User-Agent": UA, Accept: "application/json" },
-  });
   if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
   let text = await res.text();
   const start = text.search(/[\[{]/);
@@ -836,6 +848,8 @@ async function verifyStreams(qualities) {
 }
 
 module.exports = {
+  API_BASE,
+  UA,
   home,
   animeDetail,
   schedule,
