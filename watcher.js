@@ -82,7 +82,9 @@ if (!cred) {
 const isTestMode =
   process.argv.includes("--test") ||
   process.argv.includes("--test-eps") ||
-  process.argv.some((a) => a.startsWith("--test-anime="));
+  process.argv.includes("--dry-schedule") ||
+  process.argv.some((a) => a.startsWith("--test-anime=")) ||
+  process.argv.some((a) => a.startsWith("--dry-schedule="));
 
 if (!isTestMode) {
   if (!acquireLock()) process.exit(0);
@@ -279,31 +281,15 @@ async function notifyEpisode(anime, ep, users, tokens) {
 
 async function tick() {
   try {
-    const recent = await getRecent();
     const users = await getAllUsers();
     const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
     const now = Date.now();
     const scheduleMap = await getScheduleMap();
     const newEpisodes = [];
 
-    for (const anime of recent) {
-      const animeId = anime.animeId || anime.id;
-      if (!animeId) continue;
-      const ep = epNum(anime.episode || anime.episodes || anime.lastEpisode || "");
-      const prevMax = maxByAnime[animeId] || 0;
-      if (ep !== null && ep > prevMax) {
-        if (prevMax > 0 || snapshotLoadedFromRemote) {
-          if (isScheduledRelease(animeId, scheduleMap)) {
-            newEpisodes.push({ anime, ep });
-          } else {
-            console.log(`[watcher] dilewati (tidak sesuai jadwal rilis): ${cleanTitle(anime.title)} EP ${ep}`);
-          }
-        }
-        maxByAnime[animeId] = ep;
-      } else if (ep !== null) {
-        maxByAnime[animeId] = Math.max(prevMax, ep);
-      }
-    }
+    // DETEKSI MURNI JADWAL: nggak pakai feed "latest episode" sama sekali.
+    // Snapshot tiap slug disimpan sebagai { u: updated, e: episode }.
+    if (scheduleMap) await collectScheduleReleases(scheduleMap, now, newEpisodes);
 
     if (newEpisodes.length > 0 && baselineDone) {
       for (const { anime, ep } of newEpisodes) {
@@ -314,7 +300,7 @@ async function tick() {
         await notifyEpisode(anime, ep, users, tokens);
       }
     } else {
-      console.log(`[watcher] baseline dicatat (${recent.length} item, ${newEpisodes.length} baru) — tidak ada notif`);
+      console.log(`[watcher] tidak ada rilis baru terdeteksi dari jadwal (${newEpisodes.length})`);
     }
 
     baselineDone = true;
@@ -327,7 +313,58 @@ async function tick() {
   }
 }
 
-// heartbeat: tulis status tiap tick ke Firestore biar bisa dicek dari luar
+// deteksi rilis dari /schedule saja. Membaca & meng-update maxByAnime
+// (snapshot per slug: { u: sched.updated, e: episode }), push ke newEpisodes.
+// Safety net: untuk semua anime jadwal yang "lagi tayang" (updated < 7 hari),
+// jumlah episode aktual dicek TIAP tick → kalau naik langsung notif, walau
+// field `updated` di schedule tidak berubah. Window 7 hari biar menutup
+// siklus rilis mingguan.
+async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
+  const FRESH_MS = 7 * 24 * 3600 * 1000;
+  for (const [slug, sched] of Object.entries(scheduleMap)) {
+    const schedUpdated = Number(sched.updated || 0);
+    if (!schedUpdated) continue;
+    const prev = maxByAnime[slug];
+    const prevU = prev && typeof prev === "object" ? prev.u : undefined;
+    const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
+    const isFresh = now - schedUpdated * 1000 < FRESH_MS;
+    const isFirstTime = prevU === undefined;
+    const isNewRelease = prevU !== undefined && schedUpdated > prevU;
+
+    // Tidak fresh & bukan release baru → tak ada notif, cuma catat
+    // baseline episode biar nanti ada pembanding.
+    if (!isFresh && !isNewRelease) {
+      if (isFirstTime && prevE === 0) {
+        const ep = await fetchEpisodeCount(slug);
+        if (ep > 0) maxByAnime[slug] = { e: ep };
+      }
+      continue;
+    }
+
+    const ep = await fetchEpisodeCount(slug);
+    if (!(ep > 0)) continue;
+    if (ep > prevE) {
+      newEpisodes.push({
+        anime: { animeId: slug, title: sched.title || slug, poster: sched.poster || "" },
+        ep,
+      });
+    }
+    maxByAnime[slug] = { u: schedUpdated, e: ep };
+  }
+}
+
+// ambil jumlah episode aktual dari detail series (backend cache 30 menit)
+async function fetchEpisodeCount(slug) {
+  try {
+    const res = await fetch(`${API_BASE}/anime/${slug}`, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) return 0;
+    const d = await res.json();
+    return Number(d.maxEpisode || d.totalEpisodes || 0);
+  } catch {
+    return 0;
+  }
+}
+
 async function heartbeat(err) {
   try {
     await db.collection("_system").doc("watcher").set({
@@ -402,8 +439,39 @@ async function sendTestAnime(slug) {
   console.log("  selesai (FCM + notif in-app terkirim)");
 }
 
+// dry-run deteksi jadwal: jalankan logika deteksi TANPA kirim FCM & TANPA
+// menulis snapshot. Opsional "poke:<slug>" utk mensimulasikan rilis baru
+// (snapshot slug tsb di-turunkan di memori) biar bisa lihat notif bakal nyala.
+async function sendTestScheduleDry(pokeSlug) {
+  await loadRemoteSnapshot();
+  const scheduleMap = await getScheduleMap();
+  if (!scheduleMap) return console.log("[watcher] --dry-schedule gagal: jadwal tidak dimuat");
+  if (pokeSlug) {
+    const cur = await fetchEpisodeCount(pokeSlug);
+    maxByAnime[pokeSlug] = { u: 0, e: Math.max(0, cur - 1) };
+    console.log(`[watcher] --dry-schedule poke: ${pokeSlug} snapshot di-set ke EP ${Math.max(0, cur - 1)} (simulasi rilis baru)`);
+  }
+  const newEpisodes = [];
+  await collectScheduleReleases(scheduleMap, Date.now(), newEpisodes);
+  if (newEpisodes.length === 0) {
+    console.log("[watcher] dry-run: TIDAK ADA rilis baru dari jadwal");
+  } else {
+    for (const { anime, ep } of newEpisodes) {
+      console.log(`[watcher] dry-run: AKAN NOTIF → ${cleanTitle(anime.title)} EP ${ep}`);
+    }
+  }
+  console.log(`[watcher] dry-run selesai (${newEpisodes.length} notif, snapshot TIDAK diubah)`);
+}
+
 const testAnimeArg = process.argv.find((a) => a.startsWith("--test-anime="));
-if (testAnimeArg) {
+const dryScheduleArg = process.argv.find((a) => a.startsWith("--dry-schedule="));
+if (dryScheduleArg) {
+  const pokeSlug = dryScheduleArg.split("=")[1].replace(/^poke:/, "");
+  sendTestScheduleDry(dryScheduleArg.split("=")[1].startsWith("poke:") ? pokeSlug : undefined)
+    .then(() => process.exit(0));
+} else if (process.argv.includes("--dry-schedule")) {
+  sendTestScheduleDry().then(() => process.exit(0));
+} else if (testAnimeArg) {
   const slug = testAnimeArg.split("=")[1];
   if (!slug) {
     console.log("[watcher] pakai: node watcher.js --test-anime=<slug> (contoh: --test-anime=mao-sub-indo)");
