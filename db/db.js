@@ -28,6 +28,11 @@ async function initPg() {
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.PG_SSL === "false" ? false : { rejectUnauthorized: false },
   });
+  // Jangan biarkan error koneksi (mis. ECONNABORTED / pool idle timeout) nge-crash
+  // proses. Pool akan membuat koneksi baru otomatis.
+  pool.on("error", (err) => {
+    console.error("[db:pg] pool error (diabaikan):", err.message);
+  });
   await pool.query(
     `CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
