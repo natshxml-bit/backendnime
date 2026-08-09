@@ -16,6 +16,23 @@ const BASE = path.join(__dirname, "..");
 const LOG = path.join(BASE, "db", "cloudflared.log");
 const LAST = path.join(BASE, "db", "last-relay-url");
 
+function loadEnv() {
+  try {
+    const raw = fs.readFileSync(path.join(BASE, ".env"), "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (!m || m[1].startsWith("#")) continue;
+      const key = m[1];
+      let val = m[2].trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] === undefined) process.env[key] = val;
+    }
+  } catch {}
+}
+loadEnv();
+
 const TOKEN = process.env.RAILWAY_API_TOKEN;
 if (!TOKEN) {
   console.error("[relay-url] RAILWAY_API_TOKEN belum di-set di .env");
@@ -98,7 +115,7 @@ async function gql(query, variables) {
 
   await gql(
     `mutation variableUpsert($input: VariableUpsertInput!) {
-       variableUpsert(input: $input) { name }
+       variableUpsert(input: $input)
      }`,
     {
       input: {
