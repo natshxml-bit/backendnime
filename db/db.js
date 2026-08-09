@@ -120,11 +120,12 @@ async function keysLike(pattern) {
 }
 
 async function counts() {
-  const c = { anime: 0, episodes: 0, lists: 0, home: false, schedule: false, genres: false };
+  const c = { catalog: 0, anime: 0, episodes: 0, lists: 0, home: false, schedule: false, genres: false };
   if (mode() === "pg") {
     const pool = await initPg();
     const { rows } = await pool.query(
       `SELECT
+         COUNT(*) FILTER (WHERE key = 'catalog')     AS catalog,
          COUNT(*) FILTER (WHERE key LIKE 'anime:%')  AS anime,
          COUNT(*) FILTER (WHERE key LIKE 'ep:%')     AS episodes,
          COUNT(*) FILTER (WHERE key LIKE 'list:%')   AS lists,
@@ -134,6 +135,7 @@ async function counts() {
        FROM kv`
     );
     const r = rows[0];
+    c.catalog = Number(r.catalog) > 0;
     c.anime = Number(r.anime);
     c.episodes = Number(r.episodes);
     c.lists = Number(r.lists);
@@ -143,6 +145,7 @@ async function counts() {
     return c;
   }
   const db = initSqlite();
+  c.catalog = !!(await get("catalog"));
   c.anime = db.prepare("SELECT COUNT(*) c FROM kv WHERE key LIKE 'anime:%'").get().c;
   c.episodes = db.prepare("SELECT COUNT(*) c FROM kv WHERE key LIKE 'ep:%'").get().c;
   c.lists = db.prepare("SELECT COUNT(*) c FROM kv WHERE key LIKE 'list:%'").get().c;

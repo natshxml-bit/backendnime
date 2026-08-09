@@ -133,6 +133,35 @@ async function dbFirst(key, liveFn, maxAgeMs) {
   }
 }
 
+// Pencarian offline: cari judul di full catalog (4759 anime) yang tersimpan
+// di DB. Mengembalikan bentuk yang sama dengan adapter.searchQuery.
+async function localSearch(q) {
+  const rec = await db.get("catalog");
+  if (!rec) return null;
+  const ql = String(q || "").toLowerCase().trim();
+  if (!ql) return null;
+  const items = Array.isArray(rec.value) ? rec.value : Object.values(rec.value || {}).flat();
+  const animeList = [];
+  for (const it of items) {
+    const title = it.judul || it.anime_name || it.name || "";
+    if (!title.toLowerCase().includes(ql)) continue;
+    animeList.push({
+      animeId: String(it.url || it.link || it.id || ""),
+      title,
+      poster: it.cover || it.thumb || "",
+      score: null,
+      status: null,
+      type: null,
+      episode: it.lastch || it.episode || null,
+      quality: null,
+      genres: Array.isArray(it.genre) ? it.genre : [],
+      synopsis: it.sinopsis || null,
+    });
+    if (animeList.length >= 30) break;
+  }
+  return { query: String(q), animeList, results: animeList, source: "catalog" };
+}
+
 app.get("/home", wrap(() => dbFirst("home", () => adapter.home(), 5 * 60 * 1000)));
 app.get("/watcher-feed", wrap(() => adapter.recentDetailed()));
 
@@ -276,7 +305,12 @@ app.get("/genre/:slug", wrap((req) => {
   return dbFirst(`genre:${req.params.slug}:${page}`, () => adapter.byGenre(req.params.slug, page), 6 * 60 * 60 * 1000);
 }));
 
-app.get("/search/:query", wrap((req) => adapter.searchQuery(req.params.query)));
+app.get("/search/:query", wrap(async (req) => {
+  const q = String(req.params.query || "");
+  const local = await localSearch(q);
+  if (local) return local;
+  return adapter.searchQuery(q);
+}));
 
 app.get("/ongoing-anime", wrap((req) => {
   const page = parseInt(req.query.page, 10) || 1;
@@ -483,7 +517,9 @@ if (process.env.AUTO_SYNC_HOURS && parseFloat(process.env.AUTO_SYNC_HOURS) > 0) 
   const OPTS = {
     home: true,
     schedule: true,
-    details: 10,
+    catalog: true,
+    details: 0,
+    ongoing: 15,
     syncEpisodes: true,
     episodesPer: 2,
     lists: 2,

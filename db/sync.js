@@ -2,11 +2,12 @@
 // HANYA jalankan dari IP rumah/ISP (Termux/PC), bukan dari Railway.
 //
 // Penggunaan:
-//   node db/sync.js --all
-//   node db/sync.js --home --schedule --details=15 --episodesPer=3
-//   node db/sync.js --details=20 --episodes   (semua episode per anime)
-//   node db/sync.js --lists=5                 (list per jenis, 5 halaman)
-//   node db/sync.js --genres --genrePages=2   (daftar + halaman genre)
+//   node db/sync.js --all            (full: catalog + home + schedule +
+//                                     detail semua ongoing + episode terbaru)
+//   node db/sync.js --catalog        (full catalog 4.759 judul, 1 request)
+//   node db/sync.js --ongoing=50 --episodesPer=3
+//   node db/sync.js --lists=5
+//   node db/sync.js --genres --genrePages=2
 
 const { runSync } = require("./sync_core");
 
@@ -22,7 +23,9 @@ const num = (flag, def) => {
 const OPTS = {
   home: has("--all") || has("--home"),
   schedule: has("--all") || has("--schedule"),
-  details: has("--all") ? 15 : num("--details", 0),
+  catalog: has("--all") || has("--catalog"),
+  details: has("--all") ? 0 : num("--details", 0),
+  ongoing: has("--all") ? -1 : num("--ongoing", 0),
   syncEpisodes: has("--all") || has("--episodes") || args.some((a) => a.startsWith("--episodesPer")),
   episodesPer: num("--episodesPer", has("--all") ? 3 : 0),
   lists: has("--all") ? 3 : num("--lists", 0),

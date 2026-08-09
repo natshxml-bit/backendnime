@@ -19,6 +19,14 @@ async function syncHome() {
   return { recent: (data.recent || []).length };
 }
 
+async function syncCatalog() {
+  console.time("[sync] catalog");
+  const items = await adapter.fullList();
+  await db.set("catalog", items);
+  console.timeEnd("[sync] catalog");
+  return { count: Array.isArray(items) ? items.length : 0 };
+}
+
 async function syncSchedule() {
   console.time("[sync] schedule");
   const data = await adapter.schedule();
@@ -65,13 +73,44 @@ async function syncDetails(count) {
   return { ok, total: slugs.length };
 }
 
+// Sync detail anime yang statusnya ongoing (sedang tayang).
+// cap = jumlah maksimal (0 = semua).
+async function syncOngoing(cap) {
+  const slugs = [];
+  let page = 1;
+  while (page <= 50) {
+    const r = await adapter.ongoing(page);
+    const list = (r && r.animeList) || [];
+    for (const it of list) {
+      if (it && it.animeId && !slugs.includes(it.animeId)) slugs.push(it.animeId);
+    }
+    if (!r || !r.has_next) break;
+    page++;
+  }
+  if (cap > 0) slugs.length = Math.min(slugs.length, cap);
+  let ok = 0;
+  for (const slug of slugs) {
+    try {
+      console.time(`[sync] anime:${slug}`);
+      const detail = await adapter.animeDetail(slug);
+      await db.set(`anime:${slug}`, detail);
+      console.timeEnd(`[sync] anime:${slug}`);
+      ok++;
+    } catch (e) {
+      console.log(`[sync] anime:${slug} GAGAL: ${e.message}`);
+    }
+  }
+  return { ok, total: slugs.length };
+}
+
 async function syncEpisodes(per) {
   const rows = await db.keysLike("anime:%");
   const episodes = [];
   for (const key of rows) {
     const rec = await db.get(key);
     const list = rec && rec.value && Array.isArray(rec.value.episodeList) ? rec.value.episodeList : [];
-    const take = per === 0 ? list : list.slice(0, per);
+    // episodeList berurutan lama→baru, ambil yang TERBARU dari belakang
+    const take = per === 0 ? list : list.slice(-per);
     for (const ep of take) {
       if (ep && ep.endpoint && !episodes.includes(ep.endpoint)) episodes.push(ep.endpoint);
     }
@@ -148,8 +187,10 @@ async function runSync(opts) {
   const summary = { startedAt: new Date().toISOString() };
   if (O.home) summary.home = await syncHome();
   if (O.schedule) summary.schedule = await syncSchedule();
+  if (O.catalog) summary.catalog = await syncCatalog();
   if (O.details > 0) summary.details = await syncDetails(O.details);
-  if (O.syncEpisodes && O.details > 0) {
+  if (O.ongoing) summary.ongoing = await syncOngoing(O.ongoing < 0 ? 0 : O.ongoing);
+  if (O.syncEpisodes && (O.details > 0 || O.ongoing)) {
     summary.episodes = await syncEpisodes(O.episodesPer);
   }
   if (O.lists > 0) summary.lists = await syncLists(O.lists);
@@ -161,4 +202,4 @@ async function runSync(opts) {
   return summary;
 }
 
-module.exports = { runSync, syncHome, syncSchedule, syncDetails, syncEpisodes, syncLists, syncGenres };
+module.exports = { runSync, syncHome, syncSchedule, syncCatalog, syncDetails, syncOngoing, syncEpisodes, syncLists, syncGenres };

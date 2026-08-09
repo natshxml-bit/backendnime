@@ -37,6 +37,8 @@ function waitListen() {
       ["list/movie", `/list/movie`],
       ["list/donghua", `/list/donghua`],
       ["list/all", `/list/all?page=2`],
+      ["search/sakura", `/search/sakura`],
+      ["search/one piece", `/search/one%20piece`],
     ];
     const results = {};
     for (const [name, url] of cases) {
