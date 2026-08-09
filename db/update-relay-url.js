@@ -1,13 +1,13 @@
 // db/update-relay-url.js — update RELAY_URL di Railway otomatis setiap kali
 // URL tunnel cloudflared berubah (set-and-forget, dipanggil boot script).
 //
-// Butuh di .env (gitignored):
-//   RAILWAY_API_TOKEN=<token dari Railway dashboard>
-//   RAILWAY_PROJECT_NAME=<opsional, auto-deteksi kalau 1 project>
-//   RAILWAY_SERVICE_NAME=<opsional, auto-deteksi kalau 1 service>
+// Konfigurasi di .env (gitignored). Bisa pakai ID langsung atau nama:
+//   RAILWAY_API_TOKEN=<token>
+//   RAILWAY_PROJECT_ID / RAILWAY_SERVICE_ID / RAILWAY_ENVIRONMENT_ID (opsional)
+//   RAILWAY_PROJECT_NAME / RAILWAY_SERVICE_NAME (fallback auto-detect)
 //
-// Keluar dengan status 0 kalau tidak ada yang perlu di-update (supaya aman
-// dipanggil berulang dari loop).
+// Keluar dengan status 0 kalau tidak ada yang perlu di-update (aman dipanggil
+// berulang dari loop). Upsert variable otomatis memicu redeploy di Railway.
 
 const fs = require("fs");
 const path = require("path");
@@ -42,7 +42,9 @@ async function gql(query, variables) {
     body: JSON.stringify({ query, variables }),
   });
   const j = await r.json();
-  if (j.errors && j.errors.length) throw new Error(j.errors[0].message);
+  if (j.errors && j.errors.length) {
+    throw new Error(j.errors.map((e) => e.message).join(" | "));
+  }
   return j.data;
 }
 
@@ -61,50 +63,54 @@ async function gql(query, variables) {
     process.exit(0);
   }
 
-  const data = await gql(
-    `{ me { projects { id name services { id name } } } }`
-  );
-  const projects = (data.me && data.me.projects) || [];
-  let project = null;
-  if (process.env.RAILWAY_PROJECT_NAME) {
-    project = projects.find((p) => p.name === process.env.RAILWAY_PROJECT_NAME);
-  }
-  if (!project && projects.length === 1) project = projects[0];
-  if (!project) {
-    console.error("[relay-url] project tidak ditemukan. Ada:", projects.map((p) => p.name).join(", "));
-    process.exit(1);
-  }
+  let projectId = process.env.RAILWAY_PROJECT_ID;
+  let serviceId = process.env.RAILWAY_SERVICE_ID;
+  let environmentId = process.env.RAILWAY_ENVIRONMENT_ID;
 
-  const services = (project.services && project.services) || [];
-  let service = null;
-  if (process.env.RAILWAY_SERVICE_NAME) {
-    service = services.find((s) => s.name === process.env.RAILWAY_SERVICE_NAME);
-  }
-  if (!service && services.length === 1) service = services[0];
-  if (!service) {
-    console.error("[relay-url] service tidak ditemukan. Ada:", services.map((s) => s.name).join(", "));
-    process.exit(1);
+  if (!projectId || !serviceId || !environmentId) {
+    const data = await gql(
+      `{ projects { edges { node { id name services { edges { node { id name } } } environments { edges { node { id name } } } } } } }`
+    );
+    const projects = (data.projects && data.projects.edges || []).map((e) => e.node);
+    let project = projects.find((p) => p.name === process.env.RAILWAY_PROJECT_NAME) || (projects.length === 1 ? projects[0] : null);
+    if (!project) {
+      console.error("[relay-url] project tidak ditemukan. Ada:", projects.map((p) => p.name).join(", "));
+      process.exit(1);
+    }
+    projectId = project.id;
+    if (!serviceId) {
+      const services = (project.services && project.services.edges || []).map((e) => e.node);
+      serviceId = (services.find((s) => s.name === process.env.RAILWAY_SERVICE_NAME) || (services.length === 1 ? services[0] : null))?.id;
+      if (!serviceId) {
+        console.error("[relay-url] service tidak ditemukan. Ada:", services.map((s) => s.name).join(", "));
+        process.exit(1);
+      }
+    }
+    if (!environmentId) {
+      const envs = (project.environments && project.environments.edges || []).map((e) => e.node);
+      environmentId = (envs.find((e) => e.name === "production") || envs[0])?.id;
+      if (!environmentId) {
+        console.error("[relay-url] environment tidak ditemukan");
+        process.exit(1);
+      }
+    }
   }
 
   await gql(
-    `mutation variableUpsert($projectId: String!, $serviceId: String!, $name: String!, $value: String!) {
-       variableUpsert(projectId: $projectId, serviceId: $serviceId, name: $name, value: $value) { name }
+    `mutation variableUpsert($input: VariableUpsertInput!) {
+       variableUpsert(input: $input) { name }
      }`,
-    { projectId: project.id, serviceId: service.id, name: "RELAY_URL", value: url }
+    {
+      input: {
+        environmentId,
+        projectId,
+        serviceId,
+        name: "RELAY_URL",
+        value: url,
+        skipDeploys: false,
+      },
+    }
   );
-
-  // trigger redeploy biar env baru langsung terpakai (non-fatal kalau gagal)
-  try {
-    await gql(
-      `mutation serviceInstanceRedeploy($serviceId: ID!) {
-         serviceInstanceRedeploy(serviceId: $serviceId)
-       }`,
-      { serviceId: service.id }
-    );
-    console.log("[relay-url] redeploy Railway dipicu");
-  } catch (e) {
-    console.warn("[relay-url] redeploy gagal (env tetap ter-update):", e.message);
-  }
 
   fs.writeFileSync(LAST, url);
   console.log(`[relay-url] RELAY_URL diupdate → ${url}`);
