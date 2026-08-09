@@ -397,6 +397,20 @@ app.get("/db/status", async (_req, res) => {
   }
 });
 
+// GET /config — konfigurasi yang di-fetch app saat start (mis. apiBase animekita
+// terkini). Supaya kalau animekita ganti domain/versi API, cukup update env
+// ANIMEKITA_API_BASE di backend, tanpa rebuild/re-publish app.
+app.get("/config", async (_req, res) => {
+  try {
+    res.json({
+      apiBase: process.env.ANIMEKITA_API_BASE || adapter.API_BASE,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const { Readable } = require("stream");
 const moov = require("./moov");
 const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;

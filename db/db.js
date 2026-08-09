@@ -9,6 +9,24 @@
 const fs = require("fs");
 const path = require("path");
 
+// Auto-load .env bila ada (Termux/PC). Di Railway tidak ada file .env,
+// jadi no-op. Bikin node db/sync.js jalan langsung tanpa source .env manual.
+try {
+  const envFile = path.join(__dirname, "..", ".env");
+  if (fs.existsSync(envFile)) {
+    for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (!m || m[1].startsWith("#")) continue;
+      const key = m[1];
+      let val = m[2].trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] === undefined) process.env[key] = val;
+    }
+  }
+} catch {}
+
 const SQLITE_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "catalog.db");
 
 let _mode = null;
