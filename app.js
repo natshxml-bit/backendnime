@@ -4,6 +4,13 @@ const db = require("./db/db");
 const fs = require("fs");
 const path = require("path");
 
+process.on("unhandledRejection", (e) => {
+  console.error("[app] unhandledRejection:", e && e.stack ? e.stack : e);
+});
+process.on("uncaughtException", (e) => {
+  console.error("[app] uncaughtException:", e && e.stack ? e.stack : e);
+});
+
 let adminApp = null;
 function getAdmin() {
   if (adminApp) return adminApp;
