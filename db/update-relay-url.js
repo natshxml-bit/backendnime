@@ -42,8 +42,8 @@ if (!TOKEN) {
 function currentUrl() {
   try {
     const s = fs.readFileSync(LOG, "utf8");
-    const m = s.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-    return m ? m[0] : null;
+    const ms = s.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
+    return ms ? ms[ms.length - 1] : null;
   } catch {
     return null;
   }
