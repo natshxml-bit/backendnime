@@ -103,6 +103,41 @@ async function syncOngoing(cap) {
   return { ok, total: slugs.length };
 }
 
+// Sync detail SEMUA anime dari katalog (bisa ribuan judul). Dipakai untuk
+// melengkapi detail yang belum ada. Bisa dijalankan bertahap (chunk) dengan
+// jeda antar request biar tidak kena rate-limit animekita.
+// opts: { delayMs, chunk, force } — force=true untuk re-sync yang sudah ada.
+async function syncAllDetails(opts) {
+  const catalog = await db.get("catalog");
+  const items = catalog && Array.isArray(catalog.value) ? catalog.value : [];
+  const delay = (opts && opts.delayMs) || 350;
+  const chunk = (opts && opts.chunk) || 0;
+  const force = !!(opts && opts.force);
+  let slugs = [];
+  for (const it of items) {
+    const s = it && (it.animeId || it.url || it.endpoint || it.slug);
+    if (s && !slugs.includes(s)) slugs.push(s);
+  }
+  const existing = new Set(await db.keysLike("anime:%"));
+  if (!force) slugs = slugs.filter((s) => !existing.has(`anime:${s}`));
+  if (chunk > 0) slugs = slugs.slice(0, chunk);
+  console.log(`[sync] detail semua: ${slugs.length} anime (katalog ${items.length}, sudah ada ${existing.size})`);
+  let ok = 0;
+  for (const slug of slugs) {
+    try {
+      console.time(`[sync] anime:${slug}`);
+      const detail = await adapter.animeDetail(slug);
+      await db.set(`anime:${slug}`, detail);
+      console.timeEnd(`[sync] anime:${slug}`);
+      ok++;
+    } catch (e) {
+      console.log(`[sync] anime:${slug} GAGAL: ${e.message}`);
+    }
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+  }
+  return { ok, total: slugs.length, catalogTotal: items.length };
+}
+
 async function syncEpisodes(per) {
   const rows = await db.keysLike("anime:%");
   const episodes = [];
@@ -189,6 +224,7 @@ async function runSync(opts) {
   if (O.schedule) summary.schedule = await syncSchedule();
   if (O.catalog) summary.catalog = await syncCatalog();
   if (O.details > 0) summary.details = await syncDetails(O.details);
+  if (O.allDetails) summary.allDetails = await syncAllDetails(O.allDetails === true ? {} : O.allDetails);
   if (O.ongoing) summary.ongoing = await syncOngoing(O.ongoing < 0 ? 0 : O.ongoing);
   if (O.syncEpisodes && (O.details > 0 || O.ongoing)) {
     summary.episodes = await syncEpisodes(O.episodesPer);
@@ -202,4 +238,4 @@ async function runSync(opts) {
   return summary;
 }
 
-module.exports = { runSync, syncHome, syncSchedule, syncCatalog, syncDetails, syncOngoing, syncEpisodes, syncLists, syncGenres };
+module.exports = { runSync, syncHome, syncSchedule, syncCatalog, syncDetails, syncAllDetails, syncOngoing, syncEpisodes, syncLists, syncGenres };
