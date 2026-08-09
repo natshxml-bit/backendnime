@@ -343,6 +343,16 @@ async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
 
     const ep = await fetchEpisodeCount(slug);
     if (!(ep > 0)) continue;
+
+    if (isFirstTime) {
+      // baseline awal — JANGAN notif. Snapshot bisa stale/incomplete (mis.
+      // Firestore lebih sedikit dari lokal) → kalau dikategorikan "episode
+      // baru" jadi spam massal di cold start. Cukup catat, notif cuma untuk
+      // kenaikan episode NYATA di tick berikutnya.
+      maxByAnime[slug] = { u: schedUpdated, e: ep };
+      continue;
+    }
+
     if (ep > prevE) {
       newEpisodes.push({
         anime: { animeId: slug, title: sched.title || slug, poster: sched.poster || "" },
