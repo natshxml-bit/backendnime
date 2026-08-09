@@ -114,10 +114,25 @@ async function loadRemoteSnapshot() {
   try {
     const snap = await db.collection("_system").doc(SNAPSHOT_DOC).get();
     if (snap.exists && snap.data().maxByAnime) {
-      maxByAnime = snap.data().maxByAnime;
+      const remote = snap.data().maxByAnime;
+      // MERGE — JANGAN timpa lokal. Lokal (committed ke git, 131 anime) sering
+      // lebih lengkap dari Firestore (68). Kalau ditimpa, baseline anime aktif
+      // (mao, slime, dst) hilang → prevE=0 → ep skrng > 0 → false "episode baru"
+      // → spam massal di cold start. Ambil entry dengan episode tertinggi
+      // (observasi paling baru) per slug.
+      const merged = { ...maxByAnime };
+      let added = 0;
+      for (const [slug, rv] of Object.entries(remote)) {
+        const lv = merged[slug];
+        if (lv === undefined) { merged[slug] = rv; added++; continue; }
+        const lE = (typeof lv === "object" ? lv.e : lv) || 0;
+        const rE = (typeof rv === "object" ? rv.e : rv) || 0;
+        if (rE > lE) merged[slug] = rv;
+      }
+      maxByAnime = merged;
       snapshotLoadedFromRemote = true;
       baselineDone = true;
-      console.log(`[watcher] snapshot Firestore dimuat (${Object.keys(maxByAnime).length} anime)`);
+      console.log(`[watcher] snapshot Firestore dimuat (${Object.keys(remote).length} remote, +${added} baru, total ${Object.keys(maxByAnime).length} anime)`);
     }
   } catch {}
 }
