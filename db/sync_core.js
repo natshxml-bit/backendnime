@@ -11,6 +11,15 @@ const db = require("./db");
 
 const LIST_TYPES = ["ongoing", "finished", "movie", "all", "upcoming", "donghua", "anime"];
 
+// TTL (dalam ms) sebelum data yang sudah ada di-refresh ulang.
+//   EP_TTL_HOURS      (default 168 = 7 hari): episode di-re-fetch setelah
+//                     seminggu supaya mirror gak basi — tiap run heavy cuma
+//                     refresh ~1/28 total, bukan ~14 ribu sekaligus.
+//   ONGOING_TTL_HOURS (default 24 jam): detail anime ongoing di-re-fetch
+//                     ~harian, bukan tiap heavy run.
+const EP_TTL_MS = (parseFloat(process.env.EP_TTL_HOURS || "168") || 168) * 60 * 60 * 1000;
+const ONGOING_TTL_MS = (parseFloat(process.env.ONGOING_TTL_HOURS || "24") || 24) * 60 * 60 * 1000;
+
 async function syncHome() {
   console.time("[sync] home");
   const data = await adapter.home();
@@ -75,6 +84,8 @@ async function syncDetails(count) {
 
 // Sync detail anime yang statusnya ongoing (sedang tayang).
 // cap = jumlah maksimal (0 = semua).
+// Hanya re-fetch detail yang belum ada / sudah lewat ONGOING_TTL_MS; yang
+// masih fresh di-skip supaya heavy run gak fetch ribuan judul tiap 6 jam.
 async function syncOngoing(cap) {
   const slugs = [];
   let page = 1;
@@ -88,8 +99,13 @@ async function syncOngoing(cap) {
     page++;
   }
   if (cap > 0) slugs.length = Math.min(slugs.length, cap);
-  let ok = 0;
+  let ok = 0, skipped = 0;
   for (const slug of slugs) {
+    const existing = await db.get(`anime:${slug}`);
+    if (existing && Date.now() - existing.updatedAt < ONGOING_TTL_MS) {
+      skipped++;
+      continue;
+    }
     try {
       console.time(`[sync] anime:${slug}`);
       const detail = await adapter.animeDetail(slug);
@@ -100,7 +116,8 @@ async function syncOngoing(cap) {
       console.log(`[sync] anime:${slug} GAGAL: ${e.message}`);
     }
   }
-  return { ok, total: slugs.length };
+  if (skipped > 0) console.log(`[sync] ongoing: skip ${skipped} anime (masih fresh)`);
+  return { ok, total: slugs.length, skipped };
 }
 
 // Sync detail SEMUA anime dari katalog (bisa ribuan judul). Dipakai untuk
@@ -150,8 +167,13 @@ async function syncEpisodes(per) {
       if (ep && ep.endpoint && !episodes.includes(ep.endpoint)) episodes.push(ep.endpoint);
     }
   }
-  let ok = 0;
+  let ok = 0, skipped = 0;
   for (const epUrl of episodes) {
+    const existing = await db.get(`ep:${epUrl}`);
+    if (existing && Date.now() - existing.updatedAt < EP_TTL_MS) {
+      skipped++;
+      continue;
+    }
     try {
       console.time(`[sync] ep:${epUrl}`);
       const data = await adapter.episode(epUrl);
@@ -162,7 +184,8 @@ async function syncEpisodes(per) {
       console.log(`[sync] ep:${epUrl} GAGAL: ${e.message}`);
     }
   }
-  return { ok, total: episodes.length };
+  if (skipped > 0) console.log(`[sync] ep: skip ${skipped} episode (masih fresh)`);
+  return { ok, total: episodes.length, skipped };
 }
 
 async function syncGenres(pages) {
