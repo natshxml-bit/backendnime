@@ -239,10 +239,13 @@ async function apiGet(path, params = {}) {
       if (process.env.ANIMEKITA_PROXY_TOKEN) {
         headers["x-proxy-token"] = process.env.ANIMEKITA_PROXY_TOKEN;
       }
-      const res = await fetch(
-        apiUrl(process.env.ANIMEKITA_PROXY_URL, path, params),
-        { headers }
-      );
+      const url = new URL(process.env.ANIMEKITA_PROXY_URL);
+      const apiPath = new URL(API_BASE).pathname;
+      url.pathname = (url.pathname.replace(/\/+$/, "") + apiPath + "/" + path).replace(/\/{2,}/g, "/");
+      for (const [k, v] of Object.entries(params)) {
+        if (v != null && v !== "") url.searchParams.set(k, String(v));
+      }
+      const res = await fetch(url.toString(), { headers });
       if (res.ok) return parseApiBody(await res.text(), path);
       console.warn(`[apiGet] proxy worker ${res.status}, fallback relay/direct: ${path}`);
     } catch (e) {
