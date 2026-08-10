@@ -1,0 +1,6 @@
+name = "animekita-proxy"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Set token rahasia:  npx wrangler secret put PROXY_TOKEN
+# (dipakai adapter.js sebagai ANIMEKITA_PROXY_TOKEN)

@@ -203,28 +203,7 @@ function cached(key, ttlMs, fn) {
   return value;
 }
 
-async function apiGet(path, params = {}) {
-  // Bila RELAY_URL di-set (backend di Railway terblokir animekita), semua
-  // fetch live dilewatkan lewat relay yang berjalan di IP rumah/ISP.
-  const headers = { "User-Agent": UA, Accept: "application/json" };
-  let res;
-  if (process.env.RELAY_URL) {
-    const rUrl = new URL(`${process.env.RELAY_URL}/relay`);
-    rUrl.searchParams.set("path", path);
-    for (const [k, v] of Object.entries(params)) {
-      if (v != null && v !== "") rUrl.searchParams.set(k, String(v));
-    }
-    if (process.env.RELAY_TOKEN) headers["X-Relay-Token"] = process.env.RELAY_TOKEN;
-    res = await fetch(rUrl.toString(), { headers });
-  } else {
-    const url = new URL(`${API_BASE}/${path}`);
-    for (const [k, v] of Object.entries(params)) {
-      if (v != null && v !== "") url.searchParams.set(k, String(v));
-    }
-    res = await fetch(url.toString(), { headers });
-  }
-  if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
-  let text = await res.text();
+function parseApiBody(text, path) {
   const start = text.search(/[\[{]/);
   if (start >= 0) {
     const open = text[start];
@@ -237,6 +216,55 @@ async function apiGet(path, params = {}) {
     throw new Error(json.error);
   }
   return json;
+}
+
+function apiUrl(base, path, params) {
+  const url = new URL(base);
+  url.pathname = url.pathname.replace(/\/+$/, "") + "/" + path;
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== "") url.searchParams.set(k, String(v));
+  }
+  return url.toString();
+}
+
+async function apiGet(path, params = {}) {
+  // Urutan sumber fetch:
+  // 1) ANIMEKITA_PROXY_URL (Cloudflare Worker, IP CF) — bebas Termux, cocok utk sync di Railway.
+  // 2) RELAY_URL (relay di IP rumah/ISP) — fallback kalau worker gagal.
+  // 3) Direct ke apps.animekita.org — cuma jalan kalau IP-nya gak diblokir.
+  const headers = { "User-Agent": UA, Accept: "application/json" };
+
+  if (process.env.ANIMEKITA_PROXY_URL) {
+    try {
+      if (process.env.ANIMEKITA_PROXY_TOKEN) {
+        headers["x-proxy-token"] = process.env.ANIMEKITA_PROXY_TOKEN;
+      }
+      const res = await fetch(
+        apiUrl(process.env.ANIMEKITA_PROXY_URL, path, params),
+        { headers }
+      );
+      if (res.ok) return parseApiBody(await res.text(), path);
+      console.warn(`[apiGet] proxy worker ${res.status}, fallback relay/direct: ${path}`);
+    } catch (e) {
+      console.warn(`[apiGet] proxy worker error, fallback relay/direct: ${e.message}`);
+    }
+  }
+
+  if (process.env.RELAY_URL) {
+    const rUrl = new URL(`${process.env.RELAY_URL}/relay`);
+    rUrl.searchParams.set("path", path);
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") rUrl.searchParams.set(k, String(v));
+    }
+    if (process.env.RELAY_TOKEN) headers["X-Relay-Token"] = process.env.RELAY_TOKEN;
+    const res = await fetch(rUrl.toString(), { headers });
+    if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
+    return parseApiBody(await res.text(), path);
+  }
+
+  const res = await fetch(apiUrl(API_BASE, path, params), { headers });
+  if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
+  return parseApiBody(await res.text(), path);
 }
 
 function normalizeSlug(slug) {
@@ -861,6 +889,7 @@ module.exports = {
   searchQuery,
   episode,
   recommendations,
+  apiGet,
   startCrawler,
   startPosterCrawler,
   fullList,

@@ -42,8 +42,12 @@ if (!TOKEN) {
 function currentUrl() {
   try {
     const s = fs.readFileSync(LOG, "utf8");
+    // Ambil URL tunnel TERAKHIR yang valid. Regex ini juga menangkap
+    // "https://api.trycloudflare.com" yang muncul di pesan error (endpoint
+    // API, bukan URL tunnel) — buang itu supaya RELAY_URL tidak ke-set salah.
     const ms = s.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
-    return ms ? ms[ms.length - 1] : null;
+    const real = (ms || []).filter((u) => !/^https:\/\/api\.trycloudflare\.com$/.test(u));
+    return real.length ? real[real.length - 1] : null;
   } catch {
     return null;
   }
