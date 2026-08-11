@@ -210,9 +210,12 @@ app.post("/push-test", async (req, res) => {
     if (tokens.length === 0) return res.json({ sent: 0, reason: "belum ada token FCM" });
     const r = await getMessaging(adm).sendEachForMulticast({
       tokens,
-      notification: { title: "TsukiNime", body: "Notifikasi push jalan! 🔔" },
+      notification: {
+        title: req.query.title || "TsukiNime",
+        body: req.query.body || "Notifikasi push jalan! 🔔",
+      },
       android: { priority: "high", notification: { channelId: "episode_rilis" } },
-      data: { test: "1" },
+      data: { test: "1", type: req.query.type || "ADMIN" },
     });
     res.json({ sent: r.successCount, failed: r.failureCount, tokens: tokens.length });
   } catch (e) {
