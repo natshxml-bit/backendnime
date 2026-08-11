@@ -8,5 +8,6 @@ data/watcher.lock
 data/catalog.db
 data/catalog.db-*
 db/*.log
-db/last-relay-url
+data/sync.log
+.local/
 .railwayignore

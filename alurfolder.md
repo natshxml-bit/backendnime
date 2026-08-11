@@ -7,12 +7,12 @@
 │  APK (HP)   │ ───────────▶ │  Backend Railway     │ ──▶  │  Postgres    │
 │ Next.js app │ ◀─────────── │  Node/Express        │      │  (Neon)      │
 └─────────────┘   JSON/API   └─────────────────────┘      └──────────────┘
-                                        │  (data yang belum ada di DB)
+                                        │  (data yang belum ada di DB / sync)
                                         ▼
-                               ┌─────────────────────┐
-                               │  Relay Termux       │  (IP rumah)
-                               │  → animekita API    │
-                               └─────────────────────┘
+                               ┌──────────────────────────┐
+                               │ Cloudflare Worker proxy  │  (IP Cloudflare)
+                               │ animekita-proxy          │
+                               └──────────────────────────┘
                                         │
                                         ▼
                                animekita (apps.animekita.org)
@@ -20,7 +20,8 @@
 
 - **Video/streaming** TIDAK lewat backend: link `.mp4` langsung dari CDN animekita (`storage.animekita.org`) ke HP.
 - **Database sendiri** = penyimpanan metadata (home, katalog, detail anime, episode, jadwal, list). Bukan video.
-- Kenapa ada database sendiri: animekita **memblokir IP datacenter (Railway) → 403**. Jadi Railway tidak boleh nyentuh animekita langsung. Semua data ditarik dari **IP rumah (Termux)** lalu disimpan ke Postgres, Railway tinggal baca.
+- Kenapa lewat proxy: animekita **memblokir IP datacenter (Railway) → 403**, dan IP Cloudflare (Worker) tidak diblokir (animekita sendiri di balik Cloudflare). Jadi Railway → Worker → animekita, lalu hasilnya disimpan ke Postgres.
+- Relay Termux + cloudflared tunnel **sudah dipensiunkan** (cutover 2026-08-11) — Worker terbukti reliable sendirian.
 
 ---
 
@@ -28,18 +29,16 @@
 
 | File/Folder | Fungsi |
 |---|---|
-| `app.js` | Server Express utama. Semua route **DB-first** (baca database dulu), plus `/relay`, `/db/status`, auto-sync light/heavy. |
-| `adapter.js` | Pembungkus API animekita (`home`, `schedule`, `animeDetail`, `data`, `recentDetailed`, `fullList`). Dukung mode **relay** via `RELAY_URL`. |
+| `app.js` | Server Express utama. Semua route **DB-first** (baca database dulu), plus `/db/status`, auto-sync light/heavy. |
+| `adapter.js` | Pembungkus API animekita (`home`, `schedule`, `animeDetail`, `data`, `recentDetailed`, `fullList`). Fetch lewat **Cloudflare Worker** (`ANIMEKITA_PROXY_URL`). |
 | `watcher.js` | Pemantau episode baru → kirim **notif FCM** ke HP. Baca `/schedule` + `/anime/:slug` + `/watcher-feed` (semua DB). |
 | `db/db.js` | Penyimpanan kv: **Postgres** kalau `DATABASE_URL` di-set, **SQLite** (`node:sqlite`) kalau kosong. API: `get/set/del/keysLike/counts`. |
-| `db/sync_core.js` | Logika sinkronisasi: `syncHome`, `syncSchedule`, `syncCatalog`, `syncDetails`, `syncOngoing`, `syncEpisodes`, `syncLists`, `syncGenres`, `runSync(opts)`. |
+| `db/sync_core.js` | Logika sinkronisasi: `syncHome`, `syncSchedule`, `syncCatalog`, `syncDetails`, `syncOngoing`, `syncEpisodes`, `syncLists`, `syncGenres`, `runSync(opts)`. Incremental: episode/detail yang masih fresh di-skip (TTL). |
 | `db/sync.js` | CLI sync: `node db/sync.js --all`, `--catalog`, `--ongoing=N`, `--episodesPer=N`, `--lists=N`, `--genres`, `--genrePages=N`. |
-| `db/sync.sh` | Wrapper jadwal sync (dipakai di Termux). |
+| `db/sync.sh` | Wrapper jadwal sync (dipakai di Termux kalau mau manual). |
 | `db/test_routes.js` | Penguji 14 route backend. |
-| `db/test_relay.js` | Penguji jalur relay. |
-| `relay.sh` | Menjalankan relay di Termux (port 8000). |
 | `data/catalog.db` | Database SQLite lokal (gitignored). |
-| `.env` | Kredensial lokal: `DATABASE_URL`, `RELAY_TOKEN`, `AUTO_SYNC_HOURS`, `LIGHT_SYNC_MIN`. (gitignored, jangan di-commit) |
+| `.env` | Kredensial lokal: `DATABASE_URL`, `ANIMEKITA_PROXY_URL`, `ANIMEKITA_PROXY_TOKEN`, `CF_API_TOKEN`, `CF_ACCOUNT_ID`, `AUTO_SYNC_HOURS`, `LIGHT_SYNC_MIN`. (gitignored, jangan di-commit) |
 | `service-account.json` | Firebase untuk notif FCM (gitignored). |
 | `package.json` | Deps: express, firebase-admin, pg, node:sqlite. |
 
@@ -76,14 +75,14 @@
 APK → GET /home | /anime/:slug | /list/:type
      → dbFirst(key, liveFn, maxAge):
          DB fresh        → serve langsung dari Postgres/SQLite
-         DB basi         → coba ambil live (animekita/relay) → simpan → serve
+         DB basi         → coba ambil live via Worker (animekita) → simpan → serve
          live gagal      → serve data lama (backend tetap jalan walau diblokir)
 ```
 
 ### 2. Episode baru rilis
 ```
 animekita upload ep baru
-   → LIGHT SYNC (Termux, tiap 30 mnt): home + schedule + detail 25 anime terbaru
+   → LIGHT SYNC (Railway, tiap 30 mnt): home + schedule + detail 25 anime terbaru
    → HEAVY SYNC (tiap 6 jam): katalog + semua anime ongoing + episode terbaru
    → Postgres update
    → WATCHER (Railway, tiap 10 mnt): baca /schedule + /anime/:slug dari DB
@@ -96,7 +95,7 @@ Notif normal ≤ 40 menit setelah rilis (30 mnt sync + 10 mnt poll).
 ```
 APK → GET /episode/:id
      → stream tersedia (di-cache saat sync) → langsung putar
-     → belum ada di DB → lewat RELAY (kalau Termux hidup) → putar dari CDN
+     → belum ada di DB → fetch live via Worker → putar dari CDN
 ```
 
 ### 4. Pencarian
@@ -121,7 +120,6 @@ Bentuk data = key-value:
 
 ## Aturan Penting
 
-- **Sync HANYA dari IP rumah/ISP.** Jangan jalankan auto-sync di Railway (kena blokir 403).
-- `AUTO_SYNC_HOURS` (heavy, default 6 jam) & `LIGHT_SYNC_MIN` (default 30 mnt) hanya aktif saat `AUTO_SYNC_HOURS > 0`.
-- Termux **tidak wajib 24 jam**: database sudah di Postgres (cloud). Kalau Termux mati, APK tetap jalan dengan data terakhir yang tersync; hanya notif episode baru & data long-tail yang berhenti sampai Termux hidup lagi.
-- Relay butuh `RELAY_TOKEN` yang sama di backend & Railway.
+- **Sync jalan di Railway** lewat Cloudflare Worker (bukan lagi dari IP rumah). Blokir IP datacenter tidak berlaku karena egress = IP Cloudflare.
+- `AUTO_SYNC_HOURS` (heavy, default 6 jam) & `LIGHT_SYNC_MIN` (default 30 mnt) aktif selama `AUTO_SYNC_HOURS > 0`. Sync incremental (TTL) bikin heavy tetap ringan: episode/detail yang masih fresh di-skip.
+- Termux **tidak wajib nyala**: database sudah di Postgres (cloud), sync juga jalan di Railway. Termux hanya dipakai kalau mau menjalankan `db/sync.sh` manual.
