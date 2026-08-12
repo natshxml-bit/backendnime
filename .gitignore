@@ -12,3 +12,5 @@ data/sync.log
 .local/
 .railway/
 .railwayignore
+session-*.md
+opencode.json
