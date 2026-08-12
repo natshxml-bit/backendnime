@@ -6,7 +6,10 @@
 > ini menghapus verifikasi server-side sehingga URL stream langsung diputar oleh
 > device user (IP user), sesuai desain.
 >
-> Status: **menunggu persetujuan tim agent** — jangan di-apply sebelum disetujui.
+> Status: **APPLIED (hybrid) — 2026-08-12 (deploy `6920dadc`+)**. Diimplementasi
+> dengan pendekatan hybrid (lihat §3-b): `streamUrl` dijamin terisi dari mirror
+> mentah, sedangkan `server.qualities` tetap berisi mirror hasil verifikasi
+> untuk fallback app.
 
 ---
 
@@ -58,6 +61,25 @@ async function episode(slug) {
 - `verifyStreams()`/`headCheck()` boleh tetap ada di file (tidak dipakai di
   jalur episode) atau dihapus — pilihan tim.
 - Kontrak respons **tidak berubah** (field sama) → app tidak perlu diubah.
+
+### 3-b. Implementasi aktual: hybrid (2026-08-12)
+
+Verifikasi live menunjukkan CDN `storage.animekita.org` TIDAK memblokir IP
+Railway (12/12 episode `streamUrl` valid). Keputusan tim agent: **hybrid**.
+
+```js
+const verified = await verifyStreams(qualities);
+const direct = qualities.length ? qualities[0].serverList[0].url : null;
+// streamUrl = mirror mentah pertama → dijamin tidak null selama qualities ada
+// (device user yang putar, IP user). server.qualities = hasil verifyStreams
+// → app tetap punya daftar mirror hidup untuk fallback/switch kualitas.
+```
+
+- `streamUrl`/`defaultStreamingUrl` = mirror **mentah** pertama → tidak pernah
+  `null` selama `qualities` tidak kosong → menghilangkan "Video Tidak Ditemukan"
+  dari sisi server.
+- `server.qualities` = hasil `verifyStreams` (mirror hidup) → fallback.
+- `verifyStreams`/`headCheck` tetap ada dan tetap dipakai.
 
 ## 4. Dampak
 

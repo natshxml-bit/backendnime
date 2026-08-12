@@ -834,7 +834,7 @@ async function episode(slug) {
   if (!data || !data.streams) throw new Error(`episode tidak ditemukan: ${epUrl}`);
   const qualities = qualityFromStreams(data.streams, data.resoSize);
   const verified = await verifyStreams(qualities);
-  const direct = verified.length ? verified[0].serverList[0].url : null;
+  const direct = qualities.length ? qualities[0].serverList[0].url : null;
   return {
     episodeId: epUrl,
     title: `Episode ${epUrl}`,
