@@ -563,6 +563,21 @@ async function recentDetailed() {
   return out;
 }
 
+async function scheduleDayFor(slug) {
+  try {
+    const days = await schedule();
+    for (const day of days) {
+      for (const a of day.anime_list || []) {
+        if (normalizeSlug(a.animeId) === slug) {
+          const d = String(day.day || "");
+          return d ? d.charAt(0).toUpperCase() + d.slice(1) : null;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
 async function animeDetail(ref) {
   const slug = normalizeSlug(ref);
   const d = await getSeries(slug);
@@ -573,16 +588,27 @@ async function animeDetail(ref) {
       title: `Episode ${String(c.ch).split(" ")[0]}`,
       date: c.date || null,
       views: c.views || null,
+      thumbnail: null,
     }))
     .reverse();
   const basePoster = upscalePoster(d.cover);
+  const views =
+    (Array.isArray(d.chapter) ? d.chapter : []).reduce(
+      (s, c) => s + (Number(c.views) || 0),
+      0
+    ) || null;
+  const status = normalizeStatus(d.status);
   return {
     animeId: d.series_id || slug,
     title: d.judul,
+    altTitle: null,
     poster: POSTER_BY_SLUG[slug] || basePoster,
     banner: POSTER_BY_SLUG[slug] || basePoster,
     score: String(d.rating || "").replace(/[^\d.]/g, "") || null,
-    status: normalizeStatus(d.status),
+    status,
+    scheduleDay: status === "Ongoing" ? await scheduleDayFor(slug) : null,
+    views,
+    subscribers: null,
     type: d.type || null,
     synopsis: d.sinopsis || "",
     genres: Array.isArray(d.genre) ? d.genre : [],

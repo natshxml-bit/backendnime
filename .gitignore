@@ -10,4 +10,5 @@ data/catalog.db-*
 db/*.log
 data/sync.log
 .local/
+.railway/
 .railwayignore
