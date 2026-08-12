@@ -405,7 +405,7 @@ app.get("/db/status", async (_req, res) => {
 // ANIMEKITA_API_BASE di backend, tanpa rebuild/re-publish app.
 app.get("/admin/cache-bust-ep", async (_req, res) => {
   try {
-    const keys = await db.keysLike("ep:");
+    const keys = await db.keysLike("ep:%");
     for (const k of keys) await db.del(k);
     res.json({ cleared: keys.length });
   } catch (e) {
