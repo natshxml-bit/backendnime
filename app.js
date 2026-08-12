@@ -191,7 +191,25 @@ async function recentDetailedFromDb() {
   return out;
 }
 
-app.get("/home", wrap(() => dbFirst("home", () => adapter.home(), 5 * 60 * 1000)));
+app.get("/home", wrap(async (req) => {
+  const home = await dbFirst("home", () => adapter.home(), 5 * 60 * 1000);
+  function enrich(items = []) {
+    return items.map((it) => {
+      if (!it || it.banner) return it;
+      const banner = adapter.getBannerFor(it.animeId);
+      if (banner) return { ...it, banner };
+      adapter.queueBannerSearch(it.title, it.animeId);
+      return it;
+    });
+  }
+  return {
+    ...home,
+    recent: enrich(home.recent),
+    ongoing: { animeList: enrich(home.ongoing?.animeList) },
+    completed: { animeList: enrich(home.completed?.animeList) },
+    film: { animeList: enrich(home.film?.animeList) },
+  };
+}));
 app.get("/watcher-feed", wrap(async () => {
   const dbFeed = await recentDetailedFromDb();
   if (dbFeed) return dbFeed;

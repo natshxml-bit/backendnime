@@ -6,6 +6,7 @@ const path = require("path");
 const STATUS_FILE = path.join(__dirname, "statuses.json");
 const ANILIST_POSTER_FILE = path.join(__dirname, "anilistPosters.json");
 const SLUG_POSTER_FILE = path.join(__dirname, "posterBySlug.json");
+const BANNER_FILE = path.join(__dirname, "bannerBySlug.json");
 const ANILIST_GRAPHQL = "https://graphql.anilist.co";
 const CRAWL_DELAY_MS = 180;
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
@@ -25,6 +26,11 @@ try {
   POSTER_BY_SLUG = JSON.parse(fs.readFileSync(SLUG_POSTER_FILE, "utf8")) || {};
 } catch {}
 
+let BANNER_BY_SLUG = {};
+try {
+  BANNER_BY_SLUG = JSON.parse(fs.readFileSync(BANNER_FILE, "utf8")) || {};
+} catch {}
+
 function saveStatuses() {
   try {
     fs.writeFileSync(STATUS_FILE, JSON.stringify(STATUS));
@@ -40,6 +46,12 @@ function savePosters() {
 function saveSlugPosters() {
   try {
     fs.writeFileSync(SLUG_POSTER_FILE, JSON.stringify(POSTER_BY_SLUG));
+  } catch {}
+}
+
+function saveBanners() {
+  try {
+    fs.writeFileSync(BANNER_FILE, JSON.stringify(BANNER_BY_SLUG));
   } catch {}
 }
 
@@ -334,9 +346,60 @@ async function anilistSearchPoster(title) {
   }
 }
 
-const titleSearchQueue = [];
-const titleSearched = new Set();
-let titleSearchRunning = false;
+async function anilistSearchBanner(title) {
+  if (!title) return null;
+  try {
+    const query = `query($t:String){Page(perPage:3){media(search:$t,type:ANIME){id bannerImage coverImage{extraLarge}}}}`;
+    const res = await fetch(ANILIST_GRAPHQL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ query, variables: { t: String(title).slice(0, 60) } }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const m = json?.data?.Page?.media || [];
+    for (const cand of m) {
+      if (cand?.bannerImage) return cand.bannerImage;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const bannerSearchQueue = [];
+const bannerSearched = new Set();
+let bannerSearchRunning = false;
+
+function queueBannerSearch(title, slug) {
+  if (!title || !slug || bannerSearched.has(slug)) return;
+  bannerSearched.add(slug);
+  bannerSearchQueue.push({ title, slug });
+  runBannerSearchQueue();
+}
+
+async function runBannerSearchQueue() {
+  if (bannerSearchRunning) return;
+  bannerSearchRunning = true;
+  while (bannerSearchQueue.length) {
+    const batch = [];
+    while (bannerSearchQueue.length && batch.length < 3) batch.push(bannerSearchQueue.shift());
+    await Promise.all(batch.map(async ({ title, slug }) => {
+      const url = await anilistSearchBanner(title);
+      if (url && !BANNER_BY_SLUG[slug]) {
+        BANNER_BY_SLUG[slug] = url;
+        saveBanners();
+      }
+    }));
+    await sleep(800);
+  }
+  bannerSearchRunning = false;
+}
+
+function getBannerFor(slug) {
+  return BANNER_BY_SLUG[normalizeSlug(slug)] || null;
+}
+
 
 function queueTitleSearch(title, slug) {
   if (!title || !slug || titleSearched.has(slug)) return;
@@ -510,12 +573,19 @@ async function home() {
     cached("home:uploads", 5 * 60 * 1000, () => apiGet("baruupload.php", { page: 1 })),
     cached("home:movie", 10 * 60 * 1000, () => apiGet("movie.php")),
   ]);
-  const recent = (Array.isArray(uploads) ? uploads : []).map((c) => ({
-    ...cardFromList(c),
-    status: "Ongoing",
-    genres: Array.isArray(c.genre) ? c.genre : [],
-    synopsis: c.sinopsis || null,
-  }));
+  const recent = (Array.isArray(uploads) ? uploads : []).map((c) => {
+    const item = {
+      ...cardFromList(c),
+      status: "Ongoing",
+      genres: Array.isArray(c.genre) ? c.genre : [],
+      synopsis: c.sinopsis || null,
+    };
+    const slug = item.animeId;
+    const cachedBanner = BANNER_BY_SLUG[slug];
+    if (cachedBanner) item.banner = cachedBanner;
+    else queueBannerSearch(item.title, slug);
+    return item;
+  });
   const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 10);
   const completedList = (await statusList("completed", 1)).animeList.slice(0, 10);
   const movieList = (Array.isArray(movie) ? movie : []).map(cardFromList);
@@ -923,6 +993,8 @@ module.exports = {
   fullList,
   verifyCovers,
   anilistSearchPoster,
+  getBannerFor,
+  queueBannerSearch,
   statusCounts: () => {
     let ongoing = 0, completed = 0;
     for (const k of Object.keys(STATUS)) {
