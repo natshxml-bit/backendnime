@@ -833,7 +833,9 @@ async function episode(slug) {
   const data = await getEpisodeData(epUrl);
   if (!data || !data.streams) throw new Error(`episode tidak ditemukan: ${epUrl}`);
   const qualities = qualityFromStreams(data.streams, data.resoSize);
-  const verified = await verifyStreams(qualities);
+  // JANGan verifikasi dari server — headCheck memakai IP datacenter (Railway)
+  // dan ditolak upstream. URL mentah dikembalikan; device user yang memutar
+  // (IP user). Lihat BACKEND_STREAMING_FIX.md.
   const direct = qualities.length ? qualities[0].serverList[0].url : null;
   return {
     episodeId: epUrl,
@@ -841,8 +843,11 @@ async function episode(slug) {
     animeTitle: null,
     defaultStreamingUrl: direct,
     streamUrl: direct,
-    server: { qualities: verified },
-    servers: [],
+    server: null,
+    servers: qualities.map((q) => ({
+      server: q.title,
+      qualities: q.serverList.map((sv) => ({ quality: sv.quality, url: sv.url })),
+    })),
   };
 }
 
