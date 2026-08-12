@@ -103,3 +103,18 @@ Semua field di atas **nullable** — jangan break kontrak yang sudah ada.
 - `node db/test_routes.js` (uji 14 route) — pastikan tidak ada yang error.
 - Manual: `GET /anime/:slug` → field baru muncul, null-safe.
 - Jangan lupa: commit ke `main` → Railway auto-deploy dari GitHub.
+
+## 7. Bonus: rating di kartu list (`score`)
+
+- Dulu semua list (`home`, `/ongoing-anime`, `/list/:type`, search, genre) mengembalikan
+  `score: null` karena data list animekita (`anime-list.php`/`baruupload`/`search.php`)
+  tidak membawa rating.
+- Sekarang `score` diisi dari **crawl status** (`crawlWorker`): `series.php` punya
+  `rating`, disimpan sebagai `STATUS[slug].rating` (normalisasi `normalizeScore`),
+  lalu `cardFromList()` memakainya: `score: st?.rating || null` (`adapter.js:453`).
+- Efek: kartu di home/list/ongoing/search kini punya `score` string seperti `"8.2"`
+  (atau `null` kalau slug belum di-crawl / tidak punya rating). Detail tidak berubah.
+- Catatan: `STATUS` bersifat in-memory + disimpan ke `statuses.json` (TTL 24 jam,
+  di-crawl ulang tiap 30 mnt). Setelah deploy baru, butuh ~20 mnt agar rating
+  terisi penuh; `home`/`list:all:1` ikut ter-refresh oleh light sync (≤30 mnt).
+- Commit/deploy: `6920dadc` (2026-08-12).

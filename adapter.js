@@ -108,6 +108,7 @@ async function crawlWorker() {
             t: Date.now(),
             type: series.type || STATUS[slug]?.type || null,
             eps: Array.isArray(series.chapter) ? series.chapter.length : STATUS[slug]?.eps || null,
+            rating: normalizeScore(series.rating),
           };
           if (++saved % 25 === 0) saveStatuses();
         }
@@ -449,7 +450,7 @@ function cardFromList(it) {
     animeId: slug,
     title: it.judul || it.anime_name || it.name,
     poster,
-    score: null,
+    score: st?.rating || null,
     status: st?.s || it.status || null,
     type: st?.type || it.type || null,
     episode: it.lastch || st?.eps || it.episode || null,
@@ -464,6 +465,11 @@ function normalizeStatus(status) {
   if (/SELESAI|TAMAT|COMPLETED|FINISHED|ENDED/.test(s)) return "Completed";
   if (/SEDANG TAYANG|ONGOING|AIRING/.test(s)) return "Ongoing";
   return status;
+}
+
+function normalizeScore(r) {
+  const s = String(r || "").replace(/[^\d.]/g, "");
+  return s || null;
 }
 
 async function getSeries(slug) {
@@ -604,7 +610,7 @@ async function animeDetail(ref) {
     altTitle: null,
     poster: POSTER_BY_SLUG[slug] || basePoster,
     banner: POSTER_BY_SLUG[slug] || basePoster,
-    score: String(d.rating || "").replace(/[^\d.]/g, "") || null,
+    score: normalizeScore(d.rating),
     status,
     scheduleDay: status === "Ongoing" ? await scheduleDayFor(slug) : null,
     views,

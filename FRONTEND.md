@@ -103,6 +103,14 @@
 3. `altTitle` — render baris judul alternatif (13sp, ellipsis).
 4. `subscribers` — sembunyikan (null), siap render kalau diisi nanti.
 5. episode `thumbnail` — pakai fallback poster di Continue Watching.
+6. `score` di kartu list (bonus backend) — kartu anime (home/list/ongoing/search)
+   kini bisa berisi `score` string (`"8.2"`). Kalau mau, tampilkan badge rating di
+   pojok kartu; kalau `null` → sembunyikan. Contoh:
+   ```ts
+   {card.score ? <Badge>⭐ {card.score}</Badge> : null}
+   ```
+   Terisi bertahap (~20 mnt pasca-deploy, light sync ≤30 mnt); `null` = belum
+   ter-crawl / tidak ada rating.
 
 ## 6. Test
 
@@ -115,4 +123,6 @@
 
 - `2026-08-12` — Backend mengembalikan `views`, `scheduleDay`, `altTitle`,
   `subscribers`, episode `thumbnail` (commit `a841f8b`, deploy `074a078c`).
+- `2026-08-12` — Kartu list (home/ongoing/list/search) kini berisi `score`
+  (dari crawl `series.php`, bukan lagi selalu `null`) (deploy `6920dadc`).
 - Frontend: belum ada perubahan; dokumen ini adalah panduan konsumsi.
