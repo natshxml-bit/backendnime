@@ -1,8 +1,7 @@
 // watcher.js — pantau episode baru dari API, kirim FCM push + simpan notif in-app
 // jalan: node watcher.js  (opsional: node watcher.js --test utk kirim notif tes)
-// Notif HANYA dikirim untuk anime yang ada di JADWAL RILIS (/schedule) dan
-// rilisnya sesuai jadwal (hari rilis / updated terbaru) — bukan asal lihat
-// "latest episode" di feed (itu bisa re-upload/backlog → notif gak akurat).
+// Notif HANYA dikirim untuk anime yang ada di JADWAL RILIS (/schedule) —
+// feed upload terbaru TIDAK dipakai (bisa backlog/re-upload → notif akurat).
 const { initializeApp, cert } = require("firebase-admin");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
@@ -155,6 +154,58 @@ function cleanTitle(t) {
 function epNum(e) {
   const m = String(e || "").match(/\d+/);
   return m ? parseInt(m[0], 10) : null;
+}
+
+// normalisasi judul untuk pencocokan jadwal ↔ feed (abaikan case, tanda baca,
+// dan sufiks "Subtitle Indonesia"/"Sub Indo" yang bisa beda-beda sumbernya)
+function normTitle(t) {
+  return String(t || "")
+    .toLowerCase()
+    .replace(/sub(indonesia|)?\s*indonesia/gi, "")
+    .replace(/sub\s*indo/gi, "")
+    .replace(/[^a-z0-9]/gi, "")
+    .trim();
+}
+
+function titlesMatch(a, b) {
+  const x = normTitle(a), y = normTitle(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return x.length >= 8 && y.length >= 8 && (x.startsWith(y) || y.startsWith(x));
+}
+
+// jadwal.php kadang memakai slug yang TIDAK dikenal series.php (mis.
+// "youjo-senki-ii-sub-indo" vs canonical "youjo-senki-s2-sub-indo") →
+// fetch episode count pasti gagal → anime itu gak pernah ke-notif.
+// Resolve: cari lewat endpoint search lokal (DB dulu, fallback search.php)
+// dengan mencocokkan judul, pakai hasilnya sebagai slug kanonik.
+const canonicalMap = {}; // slug jadwal -> slug kanonik (di-cache per proses)
+const canonicalFail = {}; // slug jadwal -> ts gagal terakhir (retry 30 mnt)
+
+async function resolveCanonicalSlug(slug, title) {
+  if (canonicalMap[slug]) return canonicalMap[slug];
+  if (canonicalMap[slug] === null) return null; // sudah dicoba & gagal
+  if (canonicalFail[slug] && Date.now() - canonicalFail[slug] < 30 * 60 * 1000) return null;
+  try {
+    const q = String(title || slug).replace(/[^a-z0-9 ]/gi, " ").trim().slice(0, 40);
+    if (q.length < 3) { canonicalMap[slug] = null; return null; }
+    const res = await fetch(`${API_BASE}/search/${encodeURIComponent(q)}`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) { canonicalFail[slug] = Date.now(); return null; }
+    const d = await res.json();
+    const items = Array.isArray(d.animeList) ? d.animeList : [];
+    // HANYA terima kalau judul benar-benar cocok — jangan ambil item pertama
+    // (bisa salah anime → notif sampah / baseline salah)
+    const hit = items.find((it) => it && it.animeId && titlesMatch(it.title, title));
+    if (!hit || !hit.animeId) { canonicalFail[slug] = Date.now(); return null; }
+    canonicalMap[slug] = hit.animeId;
+    console.log(`[watcher] slug ${slug} di-resolve → ${hit.animeId} (search)`);
+    return hit.animeId;
+  } catch {
+    canonicalFail[slug] = Date.now();
+    return null;
+  }
 }
 
 // nama hari WIB (UTC+7) — jadwal.php pakai hari Indonesia & zona WIB,
@@ -342,10 +393,14 @@ async function tick() {
     const scheduleMap = await getScheduleMap();
     const newEpisodes = [];
 
-    // DETEKSI: jalur utama pakai jadwal (updated + jumlah episode aktual).
-    // Kalau jadwal gagal dimuat, fallback ke /watcher-feed biar notif tetap jalan.
-    if (scheduleMap) await collectScheduleReleases(scheduleMap, now, newEpisodes);
-    else await collectFeedReleases(now, newEpisodes);
+    // DETEKSI: HANYA dari jadwal rilis (/schedule), sesuai kebijakan — feed
+    // upload terbaru TIDAK dipakai sebagai sumber notif (bisa backlog/re-upload).
+    // Slug jadwal yang "palsu" di-resolve ke slug kanonik via search.
+    if (scheduleMap) {
+      await collectScheduleReleases(scheduleMap, now, newEpisodes);
+    } else {
+      console.log("[watcher] jadwal gagal dimuat — deteksi dilewati tick ini");
+    }
 
     if (newEpisodes.length > 0 && baselineDone) {
       let sent = 0;
@@ -418,79 +473,56 @@ async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
 
 async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP) {
   try {
+    let s = sched.canonical || slug;
     let schedUpdated = Number(sched.updated || 0);
     if (!Number.isFinite(schedUpdated) || schedUpdated <= 0) schedUpdated = Math.floor(now / 1000);
-    const prev = maxByAnime[slug];
+
+    let ep = await fetchEpisodeCount(s);
+    if (!(ep > 0) && !sched.canonical) {
+      // slug jadwal mungkin bukan slug yang dikenal series.php → resolve dulu
+      const r = await resolveCanonicalSlug(slug, sched.title);
+      if (r && r !== s) {
+        sched.canonical = r;
+        s = r;
+        ep = await fetchEpisodeCount(r);
+      }
+    }
+    if (!(ep > 0)) return;
+
+    const prev = maxByAnime[s];
     const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
     const isFresh = now - schedUpdated * 1000 < FRESH_MS;
     const releasedRecently = now - schedUpdated * 1000 <= RECENT_MS;
 
     // anime baru (belum punya baseline sama sekali) → catat dulu, jangan notif
     if (prev === undefined) {
-      const ep = await fetchEpisodeCount(slug);
-      if (ep > 0) maxByAnime[slug] = { u: schedUpdated, e: ep };
+      maxByAnime[s] = { u: schedUpdated, e: ep };
       return;
     }
-
-    const ep = await fetchEpisodeCount(slug);
-    if (!(ep > 0)) return;
 
     if (ep > prevE) {
       const jump = ep - prevE;
       if (releasedRecently || (isFresh && jump <= MAX_JUMP)) {
         // kirim ke tick() — baseline di-update di sana setelah notif/defer
         newEpisodes.push({
-          anime: { animeId: slug, title: sched.title || slug, poster: sched.poster || "" },
+          anime: { animeId: s, title: sched.title || s, poster: sched.poster || "" },
           ep,
           u: schedUpdated,
         });
         return;
       }
       console.log(
-        `[watcher] baseline tanpa notif: ${slug} EP ${prevE}→${ep} (catch-up lama, di-skip)`
+        `[watcher] baseline tanpa notif: ${s} EP ${prevE}→${ep} (catch-up lama, di-skip)`
       );
     }
-    maxByAnime[slug] = { u: schedUpdated, e: ep };
+    maxByAnime[s] = { u: schedUpdated, e: ep };
   } catch (e) {
     console.error(`[watcher] cek ${slug} gagal:`, e.message);
   }
 }
 
-// fallback kalau jadwal gagal dimuat: deteksi lewat /watcher-feed (upload
-// terbaru + episode aktual). Tidak ada timestamp di feed, jadi cukup andalkan
-// kenaikan episode + cap MAX_NOTIF_PER_TICK di tick().
-async function collectFeedReleases(now, newEpisodes) {
-  let feed = [];
-  try {
-    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
-    if (res.ok) feed = await res.json();
-  } catch {}
-  if (!Array.isArray(feed) || feed.length === 0) {
-    console.log("[watcher] jadwal & feed gagal dimuat — deteksi dilewati tick ini");
-    return;
-  }
-  for (const it of feed) {
-    const slug = it.animeId || it.slug;
-    const ep = Number(it.episode || it.maxEpisode || 0);
-    if (!slug || !(ep > 0)) continue;
-    const prev = maxByAnime[slug];
-    const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
-    if (prevE === 0) {
-      maxByAnime[slug] = { e: ep };
-      continue;
-    }
-    if (ep > prevE) {
-      newEpisodes.push({
-        anime: { animeId: slug, title: it.title || slug, poster: it.poster || "" },
-        ep,
-        u: (prev && typeof prev === "object" ? prev.u : 0) || 0,
-      });
-    } else {
-      maxByAnime[slug] = { e: ep };
-    }
-  }
-  console.log(`[watcher] fallback feed: ${newEpisodes.length} rilis baru (jadwal tidak tersedia)`);
-}
+// fallback deteksi dihapus: notif HANYA bersumber dari jadwal rilis
+// (kebijakan: feed upload terbaru bisa berisi backlog/re-upload).
 
 // ambil jumlah episode aktual dari detail series (backend cache 30 menit)
 async function fetchEpisodeCount(slug) {
