@@ -503,6 +503,9 @@ function getBannerFor(slug) {
   return BANNER_BY_SLUG[normalizeSlug(slug)] || null;
 }
 
+const titleSearchQueue = [];
+const titleSearched = new Set();
+let titleSearchRunning = false;
 
 function queueTitleSearch(title, slug) {
   if (!title || !slug || titleSearched.has(slug)) return;
@@ -668,6 +671,53 @@ async function getEpisodeData(epUrl) {
   });
 }
 
+async function enrichMissingRatings(items) {
+  const missing = items.filter((it) => it.score == null && it.animeId);
+  if (missing.length === 0) return;
+  await Promise.all(
+    missing.map(async (it) => {
+      try {
+        const series = await fetchSeriesStatus(it.animeId);
+        if (series) {
+          const rating = normalizeScore(series.rating);
+          if (rating) {
+            it.score = rating;
+            const slug = normalizeSlug(it.animeId);
+            if (slug) {
+              STATUS[slug] = {
+                ...(STATUS[slug] || {}),
+                s: normalizeStatus(series.status || STATUS[slug]?.s),
+                t: Date.now(),
+                type: series.type || STATUS[slug]?.type || null,
+                eps: Array.isArray(series.chapter) ? series.chapter.length : STATUS[slug]?.eps || null,
+                rating,
+              };
+            }
+          }
+        }
+      } catch {}
+    })
+  );
+}
+
+function refreshHomeRatings(home) {
+  const patch = (items) => {
+    if (!Array.isArray(items)) return;
+    for (const it of items) {
+      const slug = normalizeSlug(it?.animeId);
+      if (!slug) continue;
+      const st = STATUS[slug];
+      if (st?.rating) it.score = st.rating;
+      if (st?.s) it.status = st.s;
+      if (st?.type) it.type = st.type;
+    }
+  };
+  patch(home.recent);
+  patch(home.ongoing?.animeList);
+  patch(home.completed?.animeList);
+  patch(home.film?.animeList);
+}
+
 async function home() {
   const [uploads, movie] = await Promise.all([
     cached("home:uploads", 5 * 60 * 1000, () => apiGet("baruupload.php", { page: 1 })),
@@ -689,6 +739,10 @@ async function home() {
   const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 10);
   const completedList = (await statusList("completed", 1)).animeList.slice(0, 10);
   const movieList = (Array.isArray(movie) ? movie : []).map(cardFromList);
+
+  const allItems = [...recent, ...ongoingList, ...completedList, ...movieList];
+  await enrichMissingRatings(allItems);
+
   return {
     recent,
     ongoing: { animeList: ongoingList },
@@ -1110,4 +1164,5 @@ module.exports = {
   parseRef: (ref) => ({ id: normalizeSlug(ref), slug: normalizeSlug(ref) }),
   parseEpisodeRef: (ref) => ({ id: null, slug: null, ep: normalizeSlug(ref) }),
   recentDetailed,
+  refreshHomeRatings,
 };

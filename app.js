@@ -193,6 +193,7 @@ async function recentDetailedFromDb() {
 
 app.get("/home", wrap(async (req) => {
   const home = await dbFirst("home", () => adapter.home(), 5 * 60 * 1000);
+  adapter.refreshHomeRatings(home);
   function enrich(items = []) {
     return items.map((it) => {
       if (!it || it.banner) return it;
