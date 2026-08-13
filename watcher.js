@@ -15,6 +15,11 @@ const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
 const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "10", 10) * 60 * 1000;
 const COOLDOWN_MS = 10 * 60 * 1000;
+// notif hanya untuk rilis yang updated-nya ≤ RECENT_HOURS jam terakhir (anti
+// "rombongan": catch-up setelah watcher mati/restart cukup di-baseline diam-diam)
+const RECENT_MS = parseInt(process.env.WATCH_RECENT_HOURS || "48", 10) * 3600 * 1000;
+// maks notif per tick — sisanya di-defer ke tick berikutnya (anti spam massal)
+const MAX_NOTIF_PER_TICK = parseInt(process.env.WATCH_MAX_PER_TICK || "5", 10);
 
 function loadCredential() {
   if (fs.existsSync(SERVICE_ACCOUNT)) {
@@ -221,6 +226,33 @@ async function getAllUsers() {
   return snap.docs.map((d) => ({ id: d.id, data: d.data() }));
 }
 
+// token valid = string, unik. Token berbentuk object (bug app lama) dibuang.
+function collectTokens(users) {
+  const set = new Set();
+  for (const u of users) {
+    for (const t of Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []) {
+      if (typeof t === "string" && t.length > 0) set.add(t);
+    }
+  }
+  return [...set];
+}
+
+// sekali jalan per tick: bersihkan token sampah (object, kosong) dari Firestore
+async function cleanupTokenJunk(users) {
+  for (const u of users) {
+    const toks = u.data.fcmTokens;
+    if (!Array.isArray(toks)) continue;
+    const junk = toks.filter((t) => typeof t !== "string" || t.length === 0);
+    if (junk.length === 0) continue;
+    try {
+      await db.collection("users").doc(u.id).update({
+        fcmTokens: FieldValue.arrayRemove(...junk),
+      });
+      console.log(`[watcher] token tidak valid dihapus dari ${u.id} (${junk.length})`);
+    } catch {}
+  }
+}
+
 async function saveSnapshot() {
   // simpan ke Firestore biar persist di Railway (file lokal ephemeral)
   try {
@@ -266,9 +298,13 @@ async function notifyEpisode(anime, ep, users, tokens) {
     try {
       const resp = await messaging.sendEachForMulticast({
         tokens: chunk,
-        notification: { title, body },
+        notification: {
+          title,
+          body,
+          ...(poster ? { image: poster } : {}),
+        },
         android: { priority: "high", notification: { channelId: "episode_rilis" } },
-        data: { animeId: String(animeId), url: link },
+        data: { animeId: String(animeId), url: link, poster: poster || "" },
       });
       const invalid = new Set();
       resp.responses.forEach((r, idx) => {
@@ -294,28 +330,55 @@ async function notifyEpisode(anime, ep, users, tokens) {
   }
 }
 
+let ticking = false;
 async function tick() {
+  if (ticking) return; // cegah tick bertumpuk (tick lama belum selesai)
+  ticking = true;
   try {
     const users = await getAllUsers();
-    const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+    const tokens = collectTokens(users);
+    await cleanupTokenJunk(users);
     const now = Date.now();
     const scheduleMap = await getScheduleMap();
     const newEpisodes = [];
 
-    // DETEKSI MURNI JADWAL: nggak pakai feed "latest episode" sama sekali.
-    // Snapshot tiap slug disimpan sebagai { u: updated, e: episode }.
+    // DETEKSI: jalur utama pakai jadwal (updated + jumlah episode aktual).
+    // Kalau jadwal gagal dimuat, fallback ke /watcher-feed biar notif tetap jalan.
     if (scheduleMap) await collectScheduleReleases(scheduleMap, now, newEpisodes);
+    else await collectFeedReleases(now, newEpisodes);
 
     if (newEpisodes.length > 0 && baselineDone) {
-      for (const { anime, ep } of newEpisodes) {
-        const animeId = anime.animeId || anime.id;
-        if (now - (lastNotified[animeId] || 0) < COOLDOWN_MS) continue;
+      let sent = 0;
+      let deferred = 0;
+      for (const c of newEpisodes) {
+        const animeId = c.anime.animeId || c.anime.id;
+        if (sent >= MAX_NOTIF_PER_TICK) {
+          // defer: baseline TIDAK di-update → terdeteksi lagi tick berikutnya
+          deferred++;
+          continue;
+        }
+        if (now - (lastNotified[animeId] || 0) < COOLDOWN_MS) {
+          // baru saja dinotifikasi (cooldown) — tutup baseline, jangan notif ulang
+          maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
+          continue;
+        }
         lastNotified[animeId] = now;
-        console.log(`[watcher] Episode baru terdeteksi: ${cleanTitle(anime.title)} EP ${ep}`);
-        await notifyEpisode(anime, ep, users, tokens);
+        sent++;
+        console.log(
+          `[watcher] Episode baru terdeteksi: ${cleanTitle(c.anime.title)} EP ${c.ep}`
+        );
+        await notifyEpisode(c.anime, c.ep, users, tokens);
+        maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
+      }
+      if (deferred > 0) {
+        console.log(
+          `[watcher] ${deferred} rilis di-defer ke tick berikutnya (maks ${MAX_NOTIF_PER_TICK}/tick)`
+        );
       }
     } else {
-      console.log(`[watcher] tidak ada rilis baru terdeteksi dari jadwal (${newEpisodes.length})`);
+      console.log(
+        `[watcher] tidak ada rilis baru terdeteksi dari jadwal (${newEpisodes.length})`
+      );
     }
 
     baselineDone = true;
@@ -325,57 +388,108 @@ async function tick() {
     console.error("[watcher] tick error:", e.message);
     await heartbeat(String(e?.message || "error"));
     throw e;
+  } finally {
+    ticking = false;
   }
 }
 
-// deteksi rilis dari /schedule saja. Membaca & meng-update maxByAnime
-// (snapshot per slug: { u: sched.updated, e: episode }), push ke newEpisodes.
-// Safety net: untuk semua anime jadwal yang "lagi tayang" (updated < 7 hari),
-// jumlah episode aktual dicek TIAP tick → kalau naik langsung notif, walau
-// field `updated` di schedule tidak berubah. Window 7 hari biar menutup
-// siklus rilis mingguan.
+// deteksi rilis dari /schedule. Semua anime jadwal DICEK jumlah episode-nya
+// tiap tick (backend/local, murah) — nggak bergantung pada perubahan field
+// `updated` yang sering stale. Notif hanya kalau:
+//   - episode benar-benar naik (ep > prevE), DAN
+//   - rilisnya baru (updated ≤ RECENT_MS) ATAU masih dalam window 7 hari
+//     dengan lompatan kecil (≤ 2 ep, antisipasi double upload / updated lama).
+// Rilis lama setelah watcher mati lama → cukup di-baseline diam-diam
+// (update snapshot tanpa FCM) biar nggak jadi rombongan notif.
+// MAX_NOTIF_PER_TICK jadi pengaman terakhir di tick().
 async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
   const FRESH_MS = 7 * 24 * 3600 * 1000;
-  for (const [slug, sched] of Object.entries(scheduleMap)) {
-    const schedUpdated = Number(sched.updated || 0);
-    if (!schedUpdated) continue;
+  const MAX_JUMP = 2;
+  const entries = Object.entries(scheduleMap);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(8, entries.length) }, async () => {
+    while (i < entries.length) {
+      const [slug, sched] = entries[i++];
+      await checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP);
+    }
+  });
+  await Promise.all(workers);
+}
+
+async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP) {
+  try {
+    let schedUpdated = Number(sched.updated || 0);
+    if (!Number.isFinite(schedUpdated) || schedUpdated <= 0) schedUpdated = Math.floor(now / 1000);
     const prev = maxByAnime[slug];
-    const prevU = prev && typeof prev === "object" ? prev.u : undefined;
     const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
     const isFresh = now - schedUpdated * 1000 < FRESH_MS;
-    const isFirstTime = prevU === undefined;
-    const isNewRelease = prevU !== undefined && schedUpdated > prevU;
+    const releasedRecently = now - schedUpdated * 1000 <= RECENT_MS;
 
-    // Tidak fresh & bukan release baru → tak ada notif, cuma catat
-    // baseline episode biar nanti ada pembanding.
-    if (!isFresh && !isNewRelease) {
-      if (isFirstTime && prevE === 0) {
-        const ep = await fetchEpisodeCount(slug);
-        if (ep > 0) maxByAnime[slug] = { e: ep };
-      }
-      continue;
+    // anime baru (belum punya baseline sama sekali) → catat dulu, jangan notif
+    if (prev === undefined) {
+      const ep = await fetchEpisodeCount(slug);
+      if (ep > 0) maxByAnime[slug] = { u: schedUpdated, e: ep };
+      return;
     }
 
     const ep = await fetchEpisodeCount(slug);
-    if (!(ep > 0)) continue;
-
-    if (isFirstTime) {
-      // baseline awal — JANGAN notif. Snapshot bisa stale/incomplete (mis.
-      // Firestore lebih sedikit dari lokal) → kalau dikategorikan "episode
-      // baru" jadi spam massal di cold start. Cukup catat, notif cuma untuk
-      // kenaikan episode NYATA di tick berikutnya.
-      maxByAnime[slug] = { u: schedUpdated, e: ep };
-      continue;
-    }
+    if (!(ep > 0)) return;
 
     if (ep > prevE) {
-      newEpisodes.push({
-        anime: { animeId: slug, title: sched.title || slug, poster: sched.poster || "" },
-        ep,
-      });
+      const jump = ep - prevE;
+      if (releasedRecently || (isFresh && jump <= MAX_JUMP)) {
+        // kirim ke tick() — baseline di-update di sana setelah notif/defer
+        newEpisodes.push({
+          anime: { animeId: slug, title: sched.title || slug, poster: sched.poster || "" },
+          ep,
+          u: schedUpdated,
+        });
+        return;
+      }
+      console.log(
+        `[watcher] baseline tanpa notif: ${slug} EP ${prevE}→${ep} (catch-up lama, di-skip)`
+      );
     }
     maxByAnime[slug] = { u: schedUpdated, e: ep };
+  } catch (e) {
+    console.error(`[watcher] cek ${slug} gagal:`, e.message);
   }
+}
+
+// fallback kalau jadwal gagal dimuat: deteksi lewat /watcher-feed (upload
+// terbaru + episode aktual). Tidak ada timestamp di feed, jadi cukup andalkan
+// kenaikan episode + cap MAX_NOTIF_PER_TICK di tick().
+async function collectFeedReleases(now, newEpisodes) {
+  let feed = [];
+  try {
+    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
+    if (res.ok) feed = await res.json();
+  } catch {}
+  if (!Array.isArray(feed) || feed.length === 0) {
+    console.log("[watcher] jadwal & feed gagal dimuat — deteksi dilewati tick ini");
+    return;
+  }
+  for (const it of feed) {
+    const slug = it.animeId || it.slug;
+    const ep = Number(it.episode || it.maxEpisode || 0);
+    if (!slug || !(ep > 0)) continue;
+    const prev = maxByAnime[slug];
+    const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
+    if (prevE === 0) {
+      maxByAnime[slug] = { e: ep };
+      continue;
+    }
+    if (ep > prevE) {
+      newEpisodes.push({
+        anime: { animeId: slug, title: it.title || slug, poster: it.poster || "" },
+        ep,
+        u: (prev && typeof prev === "object" ? prev.u : 0) || 0,
+      });
+    } else {
+      maxByAnime[slug] = { e: ep };
+    }
+  }
+  console.log(`[watcher] fallback feed: ${newEpisodes.length} rilis baru (jadwal tidak tersedia)`);
 }
 
 // ambil jumlah episode aktual dari detail series (backend cache 30 menit)
@@ -402,7 +516,7 @@ async function heartbeat(err) {
 
 async function sendTest() {
   const users = await getAllUsers();
-  const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+  const tokens = collectTokens(users);
   console.log(`[watcher] --test: ${users.length} user, ${tokens.length} token`);
   if (tokens.length === 0) return console.log("[watcher] belum ada token FCM terdaftar");
   const resp = await messaging.sendEachForMulticast({
@@ -418,7 +532,7 @@ async function sendTest() {
 // (dengan poster + episode aktual), kirim lewat jalur notifyEpisode penuh.
 async function sendTestLastEps() {
   const users = await getAllUsers();
-  const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+  const tokens = collectTokens(users);
   let feed = [];
   try {
     const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
@@ -436,7 +550,7 @@ async function sendTestLastEps() {
 // dijalankan walau watcher utama sedang jalan.
 async function sendTestAnime(slug) {
   const users = await getAllUsers();
-  const tokens = users.flatMap((u) => (Array.isArray(u.data.fcmTokens) ? u.data.fcmTokens : []));
+  const tokens = collectTokens(users);
   const scheduleMap = await getScheduleMap();
   const sched = scheduleMap?.[slug];
   let detail = {};
