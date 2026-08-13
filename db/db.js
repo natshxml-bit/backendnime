@@ -142,6 +142,37 @@ async function keysLike(pattern) {
   return rows.map((r) => r.key);
 }
 
+// Ambil semua pasangan key→value dengan prefix tertentu dalam SATU query.
+// Dipakai mis. load banner per-slug ("banner:%") saat boot.
+// Mengembalikan { key: value } (tanpa prefix literal).
+async function getAllByPrefix(prefix) {
+  const literal = prefix.endsWith("%") ? prefix.slice(0, -1) : prefix;
+  if (mode() === "pg") {
+    const pool = await initPg();
+    const { rows } = await pool.query(
+      "SELECT key, value_json FROM kv WHERE key LIKE $1",
+      [prefix]
+    );
+    const out = {};
+    for (const r of rows) {
+      try {
+        out[r.key.replace(literal, "")] = JSON.parse(r.value_json);
+      } catch {}
+    }
+    return out;
+  }
+  const rows = initSqlite()
+    .prepare("SELECT key, value_json FROM kv WHERE key LIKE ?")
+    .all(prefix);
+  const out = {};
+  for (const r of rows) {
+    try {
+      out[r.key.replace(literal, "")] = JSON.parse(r.value_json);
+    } catch {}
+  }
+  return out;
+}
+
 async function counts() {
   const c = { catalog: 0, anime: 0, episodes: 0, lists: 0, home: false, schedule: false, genres: false };
   if (mode() === "pg") {
@@ -178,4 +209,4 @@ async function counts() {
   return c;
 }
 
-module.exports = { get, set, del, keysLike, counts, mode, DB_PATH: SQLITE_PATH };
+module.exports = { get, set, del, keysLike, getAllByPrefix, counts, mode, DB_PATH: SQLITE_PATH };

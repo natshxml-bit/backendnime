@@ -2,6 +2,23 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 
+// Auto-load .env (Termux/PC) biar gak perlu export manual dulu.
+try {
+  const envFile = path.join(__dirname, "..", ".env");
+  if (fs.existsSync(envFile)) {
+    for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (!m || m[1].startsWith("#")) continue;
+      const key = m[1];
+      let val = m[2].trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] === undefined) process.env[key] = val;
+    }
+  }
+} catch {}
+
 const TOKEN = process.env.CF_API_TOKEN;
 const ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const SECRET = process.env.PROXY_TOKEN;

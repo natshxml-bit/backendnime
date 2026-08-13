@@ -3,13 +3,45 @@ const UA = "Dart/2.19.6 (dart:io)";
 
 const fs = require("fs");
 const path = require("path");
+const db = require("./db/db");
 const STATUS_FILE = path.join(__dirname, "statuses.json");
 const ANILIST_POSTER_FILE = path.join(__dirname, "anilistPosters.json");
 const SLUG_POSTER_FILE = path.join(__dirname, "posterBySlug.json");
-const BANNER_FILE = path.join(__dirname, "bannerBySlug.json");
+const SLUG_BANNER_FILE = path.join(__dirname, "bannerBySlug.json");
 const ANILIST_GRAPHQL = "https://graphql.anilist.co";
 const CRAWL_DELAY_MS = 180;
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
+
+// POST GraphQL ke AniList: coba langsung dulu; kalau kena blokir/rate-limit
+// (429/403/5xx) atau error jaringan, fallback lewat worker Cloudflare kalau
+// env-nya di-set (ANILIST_PROXY_URL atau ANIMEKITA_PROXY_URL + PROXY_TOKEN).
+function anilistProxyBase() {
+  return (process.env.ANILIST_PROXY_URL || process.env.ANIMEKITA_PROXY_URL || "").replace(/\/+$/, "");
+}
+function anilistProxyToken() {
+  return process.env.ANILIST_PROXY_TOKEN || process.env.PROXY_TOKEN || "";
+}
+
+async function anilistGraphql(body) {
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  try {
+    const r = await fetch(ANILIST_GRAPHQL, { method: "POST", headers, body });
+    if (r.ok) return r;
+    if (r.status !== 429 && r.status !== 403 && r.status < 500) return r;
+  } catch {}
+  const base = anilistProxyBase();
+  if (base) {
+    try {
+      const r = await fetch(base + "/anilist/graphql", {
+        method: "POST",
+        headers: { ...headers, "x-proxy-token": anilistProxyToken() },
+        body,
+      });
+      if (r.ok) return r;
+    } catch {}
+  }
+  return null;
+}
 
 let STATUS = {};
 try {
@@ -26,10 +58,37 @@ try {
   POSTER_BY_SLUG = JSON.parse(fs.readFileSync(SLUG_POSTER_FILE, "utf8")) || {};
 } catch {}
 
+// BANNER_BY_SLUG adalah cache in-memory; sumber kebenaran ada di DB (kv,
+// key "banner:<slug>"). Diisi via initBanners() saat boot + queueBannerSearch.
 let BANNER_BY_SLUG = {};
-try {
-  BANNER_BY_SLUG = JSON.parse(fs.readFileSync(BANNER_FILE, "utf8")) || {};
-} catch {}
+
+// Load semua banner per-slug: dari file bannerBySlug.json (fallback) +
+// DB (sumber kebenaran; menang kalau key-nya ada). 1 query.
+async function initBanners() {
+  try {
+    const fileMap = {};
+    try {
+      Object.assign(fileMap, JSON.parse(fs.readFileSync(SLUG_BANNER_FILE, "utf8")) || {});
+    } catch {}
+    const dbMap = (await db.getAllByPrefix("banner:%")) || {};
+    BANNER_BY_SLUG = { ...fileMap, ...dbMap };
+    console.log(`[banner] cache siap: ${Object.keys(BANNER_BY_SLUG).length} banner`);
+  } catch (e) {
+    console.error(`[banner] init gagal: ${e.message}`);
+  }
+}
+
+// Simpan satu banner ke DB (upsert) + bannerBySlug.json biar tetap kebaca
+// meski DB kosong (mis. instance tanpa seed).
+async function persistBanner(slug, url) {
+  try {
+    await db.set(`banner:${slug}`, url);
+    BANNER_BY_SLUG[slug] = url;
+    fs.writeFileSync(SLUG_BANNER_FILE, JSON.stringify(BANNER_BY_SLUG));
+  } catch (e) {
+    console.error(`[banner] simpan gagal ${slug}: ${e.message}`);
+  }
+}
 
 function saveStatuses() {
   try {
@@ -46,12 +105,6 @@ function savePosters() {
 function saveSlugPosters() {
   try {
     fs.writeFileSync(SLUG_POSTER_FILE, JSON.stringify(POSTER_BY_SLUG));
-  } catch {}
-}
-
-function saveBanners() {
-  try {
-    fs.writeFileSync(BANNER_FILE, JSON.stringify(BANNER_BY_SLUG));
   } catch {}
 }
 
@@ -184,7 +237,7 @@ async function recommendations(limit = 12) {
     out.push({
       animeId: slug,
       title: it.judul || it.anime_name,
-      poster: POSTER_BY_SLUG[slug] || upscalePoster(it.cover || it.thumb),
+      poster: hdPoster(POSTER_BY_SLUG[slug]) || upscalePoster(it.cover || it.thumb),
       score: null,
       status: null,
       episode: it.lastch || null,
@@ -278,7 +331,10 @@ function normalizeSlug(slug) {
 }
 
 function anilistIdFromUrl(url) {
-  const m = String(url || "").match(/anilist[_-]?(\d+)/i);
+  const s = String(url || "");
+  let m = s.match(/media\/anime\/cover\/[^/]+\/(?:bx|nx|b|n)(\d+)-/i);
+  if (m) return m[1];
+  m = s.match(/anilist[_-]?(\d+)/i);
   return m ? m[1] : null;
 }
 
@@ -290,6 +346,17 @@ function upscalePoster(url) {
   out = out.replace(/[?&](?:w|resize)=\d+(?:,\d+)?/g, "");
   if (id) queueAnilistFetch(id);
   return out || url;
+}
+
+// Versi paling tajam untuk URL poster AniList: kalau ID-nya ketemu di map
+// POSTERS (hasil coverImage.extraLarge), pakai itu. Kalau gak ada, URL asli
+// dibiarkan (bukan rewrite path, karena ukuran lain di CDN punya hash beda).
+function hdPoster(url) {
+  if (!url) return url;
+  const id = anilistIdFromUrl(url);
+  if (!id) return url;
+  const hd = POSTERS[String(id)];
+  return hd && hd !== url ? hd : url;
 }
 
 const anilistQueue = [];
@@ -306,12 +373,10 @@ function queueAnilistFetch(id) {
 async function fetchAnilistByIds(ids) {
   try {
     const query = `query($ids:[Int]){Page(perPage:50){media(id_in:$ids,type:ANIME){id coverImage{extraLarge}}}}`;
-    const res = await fetch(ANILIST_GRAPHQL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ query, variables: { ids: ids.map(Number) } }),
-    });
-    if (!res.ok) return;
+    const res = await anilistGraphql(
+      JSON.stringify({ query, variables: { ids: ids.map(Number) } })
+    );
+    if (!res || !res.ok) return;
     const json = await res.json();
     const media = json?.data?.Page?.media || [];
     let changed = false;
@@ -325,16 +390,29 @@ async function fetchAnilistByIds(ids) {
   } catch {}
 }
 
+// Bersihkan judul biar match AniList: buang "Subtitle Indonesia", "Sub Indo",
+// marker Episode/Season, dan teks dalam kurung.
+function cleanTitle(t) {
+  let s = String(t || "");
+  s = s.replace(/subtitle\s*indonesia|sub\s*indo|subtitle|sub\s*(?:id|indo)?/gi, " ");
+  s = s.replace(/\(episode[^)]*\)/gi, " ");
+  s = s.replace(/episode\s*\d+/gi, " ");
+  s = s.replace(/season\s*\d+/gi, " ");
+  s = s.replace(/[\(\[][^)\]]*[\)\]]/g, " ");
+  s = s.replace(/[-_]\s*(?:movie|special|ova|ona|part\s*\d+|full)\s*$/i, "");
+  s = s.replace(/\s{2,}/g, " ").trim();
+  return s;
+}
+
 async function anilistSearchPoster(title) {
-  if (!title) return null;
+  const t = cleanTitle(title);
+  if (!t) return null;
   try {
     const query = `query($t:String){Page(perPage:3){media(search:$t,type:ANIME){id title{romaji english} coverImage{extraLarge}}}}`;
-    const res = await fetch(ANILIST_GRAPHQL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ query, variables: { t: String(title).slice(0, 60) } }),
-    });
-    if (!res.ok) return null;
+    const res = await anilistGraphql(
+      JSON.stringify({ query, variables: { t: String(t).slice(0, 60) } })
+    );
+    if (!res || !res.ok) return null;
     const json = await res.json();
     const m = json?.data?.Page?.media || [];
     for (const cand of m) {
@@ -347,24 +425,49 @@ async function anilistSearchPoster(title) {
 }
 
 async function anilistSearchBanner(title) {
-  if (!title) return null;
+  const t = cleanTitle(title);
+  if (!t) return null;
   try {
-    const query = `query($t:String){Page(perPage:3){media(search:$t,type:ANIME){id bannerImage coverImage{extraLarge}}}}`;
-    const res = await fetch(ANILIST_GRAPHQL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ query, variables: { t: String(title).slice(0, 60) } }),
-    });
-    if (!res.ok) return null;
+    const query = `query($t:String){Page(perPage:10){media(search:$t,type:ANIME){id bannerImage coverImage{extraLarge} title{romaji english native}}}}`;
+    const res = await anilistGraphql(
+      JSON.stringify({ query, variables: { t: String(t).slice(0, 60) } })
+    );
+    if (!res || !res.ok) return null;
     const json = await res.json();
     const m = json?.data?.Page?.media || [];
     for (const cand of m) {
-      if (cand?.bannerImage) return cand.bannerImage;
+      if (!cand?.bannerImage) continue;
+      const candTitle = cand.title?.romaji || cand.title?.english || cand.title?.native || "";
+      if (titleMatches(t, candTitle)) return cand.bannerImage;
     }
     return null;
   } catch {
     return null;
   }
+}
+
+// Normalisasi judul buat pembandingan (huruf kecil, tanda baca dibuang).
+function normTitle(t) {
+  return String(t || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+// Cek kecocokan query vs kandidat biar banner TIDAK salah pasang ke anime lain.
+function titleMatches(q, cand) {
+  const a = normTitle(q);
+  const b = normTitle(cand);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+  const qw = a.split(" ").filter(Boolean);
+  const cw = b.split(" ").filter(Boolean);
+  if (qw.length >= 2) {
+    const same = qw.filter((w) => w.length > 2 && cw.includes(w)).length;
+    if (same >= Math.min(2, qw.length)) return true;
+  }
+  return false;
 }
 
 const bannerSearchQueue = [];
@@ -388,7 +491,7 @@ async function runBannerSearchQueue() {
       const url = await anilistSearchBanner(title);
       if (url && !BANNER_BY_SLUG[slug]) {
         BANNER_BY_SLUG[slug] = url;
-        saveBanners();
+        await persistBanner(slug, url);
       }
     }));
     await sleep(800);
@@ -448,10 +551,7 @@ async function verifyCovers() {
         alive = res.ok || res.status === 206;
       } catch {}
       if (alive) {
-        if (POSTER_BY_SLUG[slug]) {
-          delete POSTER_BY_SLUG[slug];
-          saveSlugPosters();
-        }
+        if (POSTER_BY_SLUG[slug]) continue;
         continue;
       }
       if (POSTER_BY_SLUG[slug]) continue;
@@ -504,7 +604,7 @@ function startPosterCrawler() {
 function cardFromList(it) {
   const slug = normalizeSlug(it.url || it.link) || it.id;
   const cover = it.cover || it.thumb;
-  let poster = POSTER_BY_SLUG[slug] || upscalePoster(cover);
+  let poster = hdPoster(POSTER_BY_SLUG[slug]) || upscalePoster(cover);
   if (!POSTER_BY_SLUG[slug] && cover && /otakudesu\.blog/i.test(cover)) {
     queueTitleSearch(it.judul || it.anime_name || it.name, slug);
   }
@@ -678,8 +778,8 @@ async function animeDetail(ref) {
     animeId: d.series_id || slug,
     title: d.judul,
     altTitle: null,
-    poster: POSTER_BY_SLUG[slug] || basePoster,
-    banner: POSTER_BY_SLUG[slug] || basePoster,
+    poster: hdPoster(POSTER_BY_SLUG[slug]) || basePoster,
+    banner: BANNER_BY_SLUG[slug] || hdPoster(POSTER_BY_SLUG[slug]) || basePoster,
     score: normalizeScore(d.rating),
     status,
     scheduleDay: status === "Ongoing" ? await scheduleDayFor(slug) : null,
@@ -995,6 +1095,8 @@ module.exports = {
   anilistSearchPoster,
   getBannerFor,
   queueBannerSearch,
+  initBanners,
+  persistBanner,
   statusCounts: () => {
     let ongoing = 0, completed = 0;
     for (const k of Object.keys(STATUS)) {

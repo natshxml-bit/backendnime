@@ -1,4 +1,5 @@
 const UPSTREAM = "https://apps.animekita.org";
+const ANILIST_UPSTREAM = "https://graphql.anilist.co";
 
 async function handleRequest(request) {
   const url = new URL(request.url);
@@ -16,7 +17,10 @@ async function handleRequest(request) {
     return new Response("forbidden", { status: 403 });
   }
 
-  const target = new URL(UPSTREAM + url.pathname + url.search);
+  // /anilist/* diteruskan ke GraphQL AniList, selain itu ke animekita.
+  const isAnilist = url.pathname.startsWith("/anilist");
+  const pathname = isAnilist ? url.pathname.replace(/^\/anilist/, "") : url.pathname;
+  const target = new URL((isAnilist ? ANILIST_UPSTREAM : UPSTREAM) + pathname + url.search);
   const headers = {
     "User-Agent": "Dart/2.19.6 (dart:io)",
     Accept: "application/json",

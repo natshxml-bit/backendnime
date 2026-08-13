@@ -42,6 +42,11 @@ function normalizeStatus(s) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function normalizeScore(r) {
+  const s = String(r || "").replace(/[^\d.]/g, "");
+  return s || null;
+}
+
 (async () => {
   const d = await apiGet("anime-list.php");
   const flat = Array.isArray(d) ? d : Object.values(d).flat().filter(Boolean);
@@ -71,7 +76,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           series = Array.isArray(res.data) ? res.data[0] : null;
         } catch {}
       }
-      if (series && series.status) STATUS[slug] = { s: normalizeStatus(series.status), t: Date.now() };
+      if (series && series.status) {
+        STATUS[slug] = {
+          s: normalizeStatus(series.status),
+          t: Date.now(),
+          type: series.type || STATUS[slug]?.type || null,
+          eps: Array.isArray(series.chapter) ? series.chapter.length : STATUS[slug]?.eps || null,
+          rating: normalizeScore(series.rating),
+        };
+      }
       done++;
       if (done % 50 === 0) saveStatuses();
       if (done % 200 === 0) console.log("progress:", done, "totalKnown:", Object.keys(STATUS).length);

@@ -579,6 +579,7 @@ const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TsukiNime API on http://0.0.0.0:${PORT}`);
 });
+adapter.initBanners();
 if (process.env.NO_CRAWL !== "1") {
   adapter.startCrawler();
   adapter.startPosterCrawler();
