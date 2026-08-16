@@ -94,6 +94,7 @@ app.get("/", (_req, res) => {
       "GET /complete-anime?page=1": "anime selesai",
       "GET /list/{type}?page=1": "type: ongoing|finished|upcoming|movie|donghua|anime",
       "GET /proxy?url=...": "proxy video mp4",
+      "GET /img?url=...": "proxy gambar (dipakai image notif FCM)",
       "GET /watcher-status": "status watcher (heartbeat dari Firestore)",
       "GET /watcher-feed": "feed watcher: upload terbaru + jumlah episode aktual",
       "GET /db/status": "status database sendiri (counts + last sync)",
@@ -116,6 +117,28 @@ app.get("/watcher-status", async (_req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// proxy gambar utk FCM notification image — sebagian CDN sumber (mis.
+// cdn.myanimelist.net) bisa menolak fetcher Google/FCM; lewat sini gambar
+// disajikan dari domain sendiri sehingga selalu bisa diambil & ditampilkan.
+app.get("/img", async (req, res) => {
+  const u = String(req.query.url || "");
+  if (!/^https?:\/\//i.test(u)) return res.status(400).json({ error: "url harus http(s)" });
+  try {
+    const r = await fetch(u, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!r.ok) return res.status(502).json({ error: `upstream ${r.status}` });
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > 5 * 1024 * 1024) return res.status(413).json({ error: "gambar terlalu besar" });
+    res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(buf);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
   }
 });
 
@@ -159,7 +182,7 @@ async function localSearch(q) {
       score: null,
       status: null,
       type: null,
-      episode: it.lastch || it.episode || null,
+      episode: (() => { const n = Number(it.total_episode || it.lastch || it.episode); return Number.isFinite(n) && n > 0 ? n : null; })(),
       quality: null,
       genres: Array.isArray(it.genre) ? it.genre : [],
       synopsis: it.sinopsis || null,
@@ -231,7 +254,7 @@ app.post("/push-test", async (req, res) => {
       tokens,
       notification: {
         title: req.query.title || "TsukiNime",
-        body: req.query.body || "Notifikasi push jalan! 🔔",
+        body: req.query.body || "Notifikasi push berhasil dikirim.",
       },
       android: { priority: "high", notification: { channelId: "episode_rilis" } },
       data: { test: "1", type: req.query.type || "ADMIN" },
@@ -303,6 +326,72 @@ app.post("/admin/announcement/delete", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- STATS DASHBOARD ADMIN ----------
+// GET /admin/stats — agregasi cepat untuk kartu dashboard:
+//   onlineNow   : user dengan lastSeen ≤ 2 menit (heartbeat PresenceHeartbeat)
+//   activeDay   : user aktif 24 jam terakhir
+//   totalUsers  : total user terdaftar
+//   activeRooms : total room nobar di Firestore
+//   openReports : laporan link rusak yang belum ditangani
+//   watching    : daftar judul yang sedang ditonton (nowWatching + lastSeen segar)
+app.get("/admin/stats", requireAdmin, async (_req, res) => {
+  const fs = adminFs(getAdmin());
+  const now = Date.now();
+  const ONLINE_WINDOW = 2 * 60 * 1000;
+  const DAY_WINDOW = 24 * 3600 * 1000;
+
+  let onlineNow = 0;
+  let activeDay = 0;
+  let totalUsers = 0;
+  let activeRooms = 0;
+  let openReports = 0;
+  const watching = [];
+
+  try {
+    const usersSnap = await fs.collection("users").get();
+    totalUsers = usersSnap.size;
+    for (const d of usersSnap.docs) {
+      const data = d.data();
+      const ls = data.lastSeen;
+      let ms = 0;
+      if (ls && typeof ls.toMillis === "function") ms = ls.toMillis();
+      else if (ls && ls.seconds) ms = ls.seconds * 1000;
+      if (ms > 0 && ms >= now - ONLINE_WINDOW) {
+        onlineNow++;
+        const w = data.nowWatching;
+        if (w && (w.title || w.animeId)) watching.push(w.title || w.animeId);
+      }
+      if (ms > 0 && ms >= now - DAY_WINDOW) activeDay++;
+    }
+  } catch (e) {
+    console.error("[admin/stats] users:", e.message);
+  }
+
+  try {
+    const rooms = await fs.collection("nobar").get();
+    activeRooms = rooms.size;
+  } catch (e) {
+    console.error("[admin/stats] nobar:", e.message);
+  }
+
+  try {
+    const rep = await fs.collection("reports").where("status", "==", "open").get();
+    openReports = rep.size;
+  } catch (e) {
+    console.error("[admin/stats] reports:", e.message);
+  }
+
+  res.json({
+    onlineNow,
+    activeDay,
+    totalUsers,
+    activeRooms,
+    openReports,
+    watching: watching.slice(0, 10),
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ---------- UPLOAD FOTO PROFIL (base64 -> catbox.moe, server-side, bebas CORS) ----------
 
 async function requireAuth(req, res, next) {
@@ -350,6 +439,39 @@ app.post("/upload", requireAuth, async (req, res) => {
   } catch (e) {
     console.log(`[upload] error: ${e.message}`);
     res.status(502).json({ error: "upload gagal: " + e.message });
+  }
+});
+
+// ---------- LEADERBOARD HUNTER ----------
+// GET /leaderboard?limit=20&uid=xxx — top hunter by (level, exp). Publik,
+// tanpa data sensitif (email, fcmTokens). Kalau uid dikirim, sekalian kasih
+// posisi hunter itu di papan (myRank).
+app.get("/leaderboard", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+    const uid = String(req.query.uid || "");
+    const snap = await adminFs(getAdmin()).collection("users").get();
+    const rows = snap.docs
+      .map((d) => {
+        const data = d.data();
+        return {
+          uid: d.id,
+          nama: String(data.nama || "Hunter").slice(0, 40),
+          foto: data.foto || "",
+          level: Number(data.level) || 1,
+          exp: Number(data.exp) || 0,
+        };
+      })
+      .sort((a, b) => b.level - a.level || b.exp - a.exp);
+    const top = rows.slice(0, limit);
+    let myRank = null;
+    if (uid) {
+      const idx = rows.findIndex((r) => r.uid === uid);
+      if (idx >= 0) myRank = idx + 1;
+    }
+    res.json({ list: top, total: rows.length, myRank });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
   }
 });
 

@@ -240,7 +240,7 @@ async function recommendations(limit = 12) {
       poster: hdPoster(POSTER_BY_SLUG[slug]) || upscalePoster(it.cover || it.thumb),
       score: null,
       status: null,
-      episode: it.lastch || null,
+      episode: episodeCount(it.total_episode) || episodeCount(it.lastch) || null,
       type: it.type || null,
       genres: Array.isArray(it.genre) ? it.genre : [],
       synopsis: it.sinopsis || null,
@@ -619,10 +619,17 @@ function cardFromList(it) {
     score: st?.rating || null,
     status: st?.s || it.status || null,
     type: st?.type || it.type || null,
-    episode: it.lastch || st?.eps || it.episode || null,
+    episode: episodeCount(it.total_episode) || episodeCount(it.lastch) || st?.eps || it.episode || null,
     quality: null,
     genres: Array.isArray(it.genre) ? it.genre : [],
   };
+}
+
+// Jumlah episode sesungguhnya ada di `total_episode` (angka); `lastch` di animekita
+// sering string kosong/"Episode X" dan gak ada field `episode`. Normalisasi ke Int.
+function episodeCount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function normalizeStatus(status) {

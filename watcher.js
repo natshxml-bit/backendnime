@@ -12,6 +12,10 @@ const SERVICE_ACCOUNT = path.join(__dirname, "service-account.json");
 const SNAPSHOT_FILE = path.join(__dirname, "data", "lastEpisodes.json");
 const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
+// base URL publik buat image notif FCM — FCM ngambil gambar dari luar, jadi
+// harus URL domain publik (bukan 127.0.0.1). Gambar di-proxy lewat /img
+// biar gak ditolak fetcher FCM.
+const PUBLIC_BASE = process.env.PUBLIC_BASE || "https://backendnime.up.railway.app";
 const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "10", 10) * 60 * 1000;
 const COOLDOWN_MS = 10 * 60 * 1000;
 // notif hanya untuk rilis yang updated-nya ≤ RECENT_HOURS jam terakhir (anti
@@ -344,6 +348,9 @@ async function notifyEpisode(anime, ep, users, tokens) {
   // 2) push FCM
   if (tokens.length === 0) return;
   const CHUNK = 400;
+  const posterImg = poster
+    ? `${PUBLIC_BASE}/img?url=${encodeURIComponent(poster)}`
+    : "";
   for (let i = 0; i < tokens.length; i += CHUNK) {
     const chunk = tokens.slice(i, i + CHUNK);
     try {
@@ -352,7 +359,7 @@ async function notifyEpisode(anime, ep, users, tokens) {
         notification: {
           title,
           body,
-          ...(poster ? { image: poster } : {}),
+          ...(posterImg ? { image: posterImg } : {}),
         },
         android: { priority: "high", notification: { channelId: "episode_rilis" } },
         data: { animeId: String(animeId), url: link, poster: poster || "" },
@@ -553,7 +560,7 @@ async function sendTest() {
   if (tokens.length === 0) return console.log("[watcher] belum ada token FCM terdaftar");
   const resp = await messaging.sendEachForMulticast({
     tokens,
-    notification: { title: "TsukiNime", body: "Notifikasi push jalan! 🔔" },
+    notification: { title: "TsukiNime", body: "Notifikasi push berhasil dikirim." },
     android: { priority: "high", notification: { channelId: "episode_rilis" } },
     data: { test: "1" },
   });
