@@ -12,6 +12,11 @@ const SERVICE_ACCOUNT = path.join(__dirname, "service-account.json");
 const SNAPSHOT_FILE = path.join(__dirname, "data", "lastEpisodes.json");
 const LOCK_FILE = path.join(__dirname, "data", "watcher.lock");
 const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT || 8000}`;
+// Semua fetch internal watcher wajib bawa apikey — /schedule, /watcher-feed,
+// /home, dll. bukan route keyless (dari hardening backend).
+const API_KEY_QS = process.env.APP_API_KEY
+  ? `?apikey=${encodeURIComponent(process.env.APP_API_KEY)}`
+  : "";
 // base URL publik buat image notif FCM — FCM ngambil gambar dari luar, jadi
 // harus URL domain publik (bukan 127.0.0.1). Gambar di-proxy lewat /img
 // biar gak ditolak fetcher FCM.
@@ -193,7 +198,7 @@ async function resolveCanonicalSlug(slug, title) {
   try {
     const q = String(title || slug).replace(/[^a-z0-9 ]/gi, " ").trim().slice(0, 40);
     if (q.length < 3) { canonicalMap[slug] = null; return null; }
-    const res = await fetch(`${API_BASE}/search/${encodeURIComponent(q)}`, {
+    const res = await fetch(`${API_BASE}/search/${encodeURIComponent(q)}${API_KEY_QS}`, {
       signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) { canonicalFail[slug] = Date.now(); return null; }
@@ -223,7 +228,7 @@ function wibDayName() {
 // return null kalau gagal (biar watcher fallback ke perilaku lama).
 async function getScheduleMap() {
   try {
-    const res = await fetch(`${API_BASE}/schedule`, { signal: AbortSignal.timeout(30000) });
+    const res = await fetch(`${API_BASE}/schedule${API_KEY_QS}`, { signal: AbortSignal.timeout(30000) });
     if (!res.ok) throw new Error(`schedule ${res.status}`);
     const days = await res.json();
     if (!Array.isArray(days)) throw new Error("schedule bukan array");
@@ -264,13 +269,13 @@ async function getRecent() {
   // /watcher-feed: upload terbaru + jumlah episode AKTUAL dari series detail
   // (kartu baruupload/`home` tidak pernah berisi nomor episode).
   try {
-    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
+    const res = await fetch(`${API_BASE}/watcher-feed${API_KEY_QS}`, { signal: AbortSignal.timeout(30000) });
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) return data;
     }
   } catch {}
-  const res = await fetch(`${API_BASE}/home`, { signal: AbortSignal.timeout(20000) });
+  const res = await fetch(`${API_BASE}/home${API_KEY_QS}`, { signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`API ${res.status}`);
   const data = await res.json();
   return data?.recent || data?.ongoing?.animeList || [];
@@ -348,8 +353,9 @@ async function notifyEpisode(anime, ep, users, tokens) {
   // 2) push FCM
   if (tokens.length === 0) return;
   const CHUNK = 400;
+  const key = process.env.APP_API_KEY ? `&apikey=${encodeURIComponent(process.env.APP_API_KEY)}` : "";
   const posterImg = poster
-    ? `${PUBLIC_BASE}/img?url=${encodeURIComponent(poster)}`
+    ? `${PUBLIC_BASE}/img?url=${encodeURIComponent(poster)}${key}`
     : "";
   for (let i = 0; i < tokens.length; i += CHUNK) {
     const chunk = tokens.slice(i, i + CHUNK);
@@ -534,7 +540,7 @@ async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_J
 // ambil jumlah episode aktual dari detail series (backend cache 30 menit)
 async function fetchEpisodeCount(slug) {
   try {
-    const res = await fetch(`${API_BASE}/anime/${slug}`, { signal: AbortSignal.timeout(20000) });
+    const res = await fetch(`${API_BASE}/anime/${slug}${API_KEY_QS}`, { signal: AbortSignal.timeout(20000) });
     if (!res.ok) return 0;
     const d = await res.json();
     return Number(d.maxEpisode || d.totalEpisodes || 0);
@@ -574,7 +580,7 @@ async function sendTestLastEps() {
   const tokens = collectTokens(users);
   let feed = [];
   try {
-    const res = await fetch(`${API_BASE}/watcher-feed`, { signal: AbortSignal.timeout(30000) });
+    const res = await fetch(`${API_BASE}/watcher-feed${API_KEY_QS}`, { signal: AbortSignal.timeout(30000) });
     if (res.ok) feed = await res.json();
   } catch {}
   const item = (Array.isArray(feed) ? feed : []).find((x) => x && x.animeId && Number(x.episode) > 0);
@@ -594,7 +600,7 @@ async function sendTestAnime(slug) {
   const sched = scheduleMap?.[slug];
   let detail = {};
   try {
-    const res = await fetch(`${API_BASE}/anime/${slug}`, { signal: AbortSignal.timeout(30000) });
+    const res = await fetch(`${API_BASE}/anime/${slug}${API_KEY_QS}`, { signal: AbortSignal.timeout(30000) });
     if (res.ok) detail = await res.json();
   } catch {}
   const title = cleanTitle(detail.title || sched?.title || slug);

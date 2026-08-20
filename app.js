@@ -68,37 +68,54 @@ app.use((req, res, next) => {
   res.set({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With, Range, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With, Range, Authorization, X-Api-Key",
   });
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
+// Gate API key: semua endpoint (kecuali `/` buat health-check dan `/relay`
+// yang sudah punya token sendiri) wajib header `X-Api-Key` == APP_API_KEY.
+// APP_API_KEY dikonfigurasi via env Railway; di-rotate → clone mati.
+const KEYLESS_PATHS = new Set(["/", "/relay"]);
+function requireAppKey(req, res, next) {
+  if (KEYLESS_PATHS.has(req.path)) return next();
+  const expected = process.env.APP_API_KEY;
+  if (!expected) {
+    return res.status(503).json({ error: "APP_API_KEY belum dikonfigurasi di server" });
+  }
+  const provided = req.get("x-api-key") || req.query.apikey;
+  if (provided !== expected) {
+    return res.status(401).json({ error: "api key salah atau hilang" });
+  }
+  next();
+}
+app.use(requireAppKey);
+
+// Rate limit khusus /proxy (di-route TIDAK ikut rateLimit global).
+const PROXY_RATE_WINDOW_MS = 60 * 1000;
+const PROXY_RATE_MAX = 60;
+const proxyRateBuckets = new Map();
+function proxyRateLimit(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const bucket = proxyRateBuckets.get(ip) || [];
+  while (bucket.length && bucket[0] <= now - PROXY_RATE_WINDOW_MS) bucket.shift();
+  if (bucket.length >= PROXY_RATE_MAX) {
+    return res.status(429).json({ error: "proxy terlalu sering dipakai, tunggu sebentar" });
+  }
+  bucket.push(now);
+  proxyRateBuckets.set(ip, bucket);
+  next();
+}
+app.use("/proxy", proxyRateLimit);
+
 const VALID_LISTS = ["all", "ongoing", "finished", "upcoming", "movie", "donghua", "anime"];
 
 app.get("/", (_req, res) => {
   res.json({
-    name: "TsukiNime Scraper API",
+    name: "TsukiNime API",
     version: "3.0.0",
-    source: "https://apps.animekita.org/api/v1.2.5",
-    endpoints: {
-      "GET /home": "homepage (recent + ongoing + completed + film)",
-      "GET /recommendations?limit=12": "rekomendasi acak",
-      "GET /anime/{slug}": "anime detail + episodeList",
-      "GET /episode/{episodeId}": "episode servers + qualities",
-      "GET /schedule": "jadwal mingguan by hari",
-      "GET /genres": "daftar genre",
-      "GET /genre/{slug}?page=1": "anime by genre",
-      "GET /search/{q}": "pencarian",
-      "GET /ongoing-anime?page=1": "anime ongoing",
-      "GET /complete-anime?page=1": "anime selesai",
-      "GET /list/{type}?page=1": "type: ongoing|finished|upcoming|movie|donghua|anime",
-      "GET /proxy?url=...": "proxy video mp4",
-      "GET /img?url=...": "proxy gambar (dipakai image notif FCM)",
-      "GET /watcher-status": "status watcher (heartbeat dari Firestore)",
-      "GET /watcher-feed": "feed watcher: upload terbaru + jumlah episode aktual",
-      "GET /db/status": "status database sendiri (counts + last sync)",
-    },
   });
 });
 
@@ -123,9 +140,20 @@ app.get("/watcher-status", async (_req, res) => {
 // proxy gambar utk FCM notification image — sebagian CDN sumber (mis.
 // cdn.myanimelist.net) bisa menolak fetcher Google/FCM; lewat sini gambar
 // disajikan dari domain sendiri sehingga selalu bisa diambil & ditampilkan.
+// HARDENING: allowlist domain (kasus spam/injection via IP datacenter bebas).
+const IMG_ALLOWED = /(^|\.)(cdn\.myanimelist\.net|image\.tmdb\.org|media\.kitsu\.app|kitsu\.app|storage\.animekita\.org|animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com|i\.postimg\.cc|ibb\.co|ui-avatars\.com)$/i;
 app.get("/img", async (req, res) => {
   const u = String(req.query.url || "");
   if (!/^https?:\/\//i.test(u)) return res.status(400).json({ error: "url harus http(s)" });
+  let parsed;
+  try {
+    parsed = new URL(u);
+  } catch {
+    return res.status(400).json({ error: "url tidak valid" });
+  }
+  if (!IMG_ALLOWED.test(parsed.hostname)) {
+    return res.status(403).json({ error: "domain tidak diizinkan" });
+  }
   try {
     const r = await fetch(u, {
       signal: AbortSignal.timeout(15000),
@@ -175,18 +203,7 @@ async function localSearch(q) {
   for (const it of items) {
     const title = it.judul || it.anime_name || it.name || "";
     if (!title.toLowerCase().includes(ql)) continue;
-    animeList.push({
-      animeId: String(it.url || it.link || it.id || ""),
-      title,
-      poster: it.cover || it.thumb || "",
-      score: null,
-      status: null,
-      type: null,
-      episode: (() => { const n = Number(it.total_episode || it.lastch || it.episode); return Number.isFinite(n) && n > 0 ? n : null; })(),
-      quality: null,
-      genres: Array.isArray(it.genre) ? it.genre : [],
-      synopsis: it.sinopsis || null,
-    });
+    animeList.push(await adapter.cardFromListAsync(it));
     if (animeList.length >= 30) break;
   }
   return { query: String(q), animeList, results: animeList, source: "catalog" };
@@ -240,10 +257,13 @@ app.get("/watcher-feed", wrap(async () => {
   return adapter.recentDetailed();
 }));
 
-// trigger notif tes manual: POST /push-test?key=tsukitest
-app.post("/push-test", async (req, res) => {
-  if (req.query.key !== "tsukitest") return res.status(403).json({ error: "key salah" });
+// trigger notif tes manual: POST /push-test — WAJIB admin (token Firebase)
+// HARDENING: dulu pakai kunci statis "tsukitest" — siapa pun yang tau API key
+// (bocor di bundle app) bisa blast FCM ke SEMUA user. Sekarang admin-only.
+app.post("/push-test", requireAdmin, async (req, res) => {
   try {
+    const title = String(req.query.title || "TsukiNime").slice(0, 80);
+    const body = String(req.query.body || "Notifikasi push berhasil dikirim.").slice(0, 200);
     const { getFirestore } = require("firebase-admin/firestore");
     const { getMessaging } = require("firebase-admin/messaging");
     const adm = getAdmin();
@@ -252,12 +272,9 @@ app.post("/push-test", async (req, res) => {
     if (tokens.length === 0) return res.json({ sent: 0, reason: "belum ada token FCM" });
     const r = await getMessaging(adm).sendEachForMulticast({
       tokens,
-      notification: {
-        title: req.query.title || "TsukiNime",
-        body: req.query.body || "Notifikasi push berhasil dikirim.",
-      },
+      notification: { title, body },
       android: { priority: "high", notification: { channelId: "episode_rilis" } },
-      data: { test: "1", type: req.query.type || "ADMIN" },
+      data: { test: "1", type: String(req.query.type || "ADMIN").slice(0, 30) },
     });
     res.json({ sent: r.successCount, failed: r.failureCount, tokens: tokens.length });
   } catch (e) {
@@ -406,8 +423,11 @@ async function requireAuth(req, res, next) {
   }
 }
 
-app.post("/upload", requireAuth, async (req, res) => {
-  const { image } = req.body || {};
+app.post("/upload", async (req, res) => {
+  // Log SEBELUM requireAuth — buat diagnosa: nyampe server atau nggak.
+  console.log(`[upload] hit dari ${req.ip || "?"} (sebelum auth)`);
+  return requireAuth(req, res, async () => {
+    const { image } = req.body || {};
   if (!image || typeof image !== "string") {
     return res.status(400).json({ error: "data image base64 wajib" });
   }
@@ -416,29 +436,249 @@ app.post("/upload", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "ukuran foto terlalu besar (maks 6MB)" });
   }
   console.log(`[upload] uid=${req.uid} bytes=${Math.floor(b64.length * 0.75)}`);
-  try {
+
+  // Host anonim yang BISA hotlink (cek 18 Agu 2026):
+  // - catbox.moe: OK saat ini (files.catbox.moe, hotlink langsung) — naik-turun
+  // - imgbb: OK kalau IMGBB_API_KEY di-env (i.ibb.co langsung) — prioritas kalo ada
+  // - qu.ax: GUGUR (anti-hotlink — balikin halaman HTML bukan gambar)
+  // - vgy.me: butuh akun; pixeldrain: butuh auth — GUGUR
+  // Semua fetch wajib timeout — host mati tidak boleh bikin request gantung.
+  const UPLOAD_TIMEOUT = 20000;
+
+  async function uploadCatbox(b64data) {
     const form = new FormData();
     form.append("reqtype", "fileupload");
     form.append(
       "fileToUpload",
-      new Blob([Buffer.from(b64, "base64")], { type: "image/png" }),
+      new Blob([Buffer.from(b64data, "base64")], { type: "image/png" }),
       "pfp.png"
     );
     const r = await fetch("https://catbox.moe/user/api.php", {
       method: "POST",
       body: form,
-      headers: { "User-Agent": "TsukiNime/1.0" },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+        "Accept": "*/*",
+      },
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
     });
     const text = await r.text();
     if (!r.ok || !/^https?:\/\//.test(text.trim())) {
-      console.log(`[upload] gagal: HTTP ${r.status} ${text.slice(0, 120)}`);
-      return res.status(502).json({ error: "upload gagal: " + text.slice(0, 120) });
+      throw new Error(`catbox HTTP ${r.status} ${text.slice(0, 80)}`);
     }
-    console.log(`[upload] sukses: ${text.trim().slice(0, 60)}`);
-    res.json({ url: text.trim() });
+    return text.trim();
+  }
+
+  async function uploadTelegraph(b64data) {
+    const form = new FormData();
+    form.append(
+      "file",
+      new Blob([Buffer.from(b64data, "base64")], { type: "image/png" }),
+      "pfp.png"
+    );
+    const r = await fetch("https://telegra.ph/upload", {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+    });
+    const j = await r.json().catch(() => null);
+    if (Array.isArray(j) && j[0] && j[0].src) {
+      return "https://telegra.ph" + j[0].src;
+    }
+    throw new Error(`telegra.ph HTTP ${r.status}`);
+  }
+
+  async function uploadUguu(b64data) {
+    const form = new FormData();
+    form.append(
+      "files[]",
+      new Blob([Buffer.from(b64data, "base64")], { type: "image/png" }),
+      "pfp.png"
+    );
+    const r = await fetch("https://uguu.se/upload", {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && j.success && j.files && j.files[0] && j.files[0].url) {
+      return String(j.files[0].url);
+    }
+    throw new Error(`uguu.se HTTP ${r.status}`);
+  }
+
+  async function uploadFilebin(b64data) {
+    const form = new FormData();
+    form.append(
+      "file",
+      new Blob([Buffer.from(b64data, "base64")], { type: "image/png" }),
+      "pfp.png"
+    );
+    const r = await fetch("https://filebin.net/tsu-test", {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && j.file && j.file.url) {
+      const name = j.file.filename;
+      return `https://filebin.net/tsu-test/${name}`;
+    }
+    throw new Error(`filebin HTTP ${r.status}`);
+  }
+
+  async function uploadImgbb(b64data) {
+    const key = process.env.IMGBB_API_KEY;
+    if (!key) throw new Error("imgbb key belum dikonfigurasi");
+    const r = await fetch("https://api.imgbb.com/1/upload", {
+      method: "POST",
+      body: new URLSearchParams({ key, image: b64data }),
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && !j.error && j.data && j.data.url) {
+      return String(j.data.url);
+    }
+    throw new Error(`imgbb HTTP ${r.status}`);
+  }
+
+  try {
+    let url = null;
+    if (process.env.IMGBB_API_KEY) {
+      try {
+        url = await uploadImgbb(b64);
+        console.log(`[upload] sukses (imgbb): ${url.slice(0, 60)}`);
+      } catch (e) {
+        console.log(`[upload] imgbb gagal: ${e.message} — coba catbox`);
+      }
+    }
+    if (!url) {
+      try {
+        url = await uploadUguu(b64);
+        console.log(`[upload] sukses (uguu.se): ${url.slice(0, 60)}`);
+      } catch (e) {
+        console.log(`[upload] uguu gagal: ${e.message} — coba filebin`);
+      }
+    }
+    if (!url) {
+      try {
+        url = await uploadFilebin(b64);
+        console.log(`[upload] sukses (filebin): ${url.slice(0, 60)}`);
+      } catch (e) {
+        console.log(`[upload] filebin gagal: ${e.message} — coba telegra.ph`);
+      }
+    }
+    if (!url) {
+      try {
+        url = await uploadTelegraph(b64);
+        console.log(`[upload] sukses (telegra.ph): ${url.slice(0, 60)}`);
+      } catch (e) {
+        console.log(`[upload] telegra.ph gagal: ${e.message} — coba catbox`);
+      }
+    }
+    if (!url) {
+      url = await uploadCatbox(b64);
+      console.log(`[upload] sukses (catbox): ${url.slice(0, 60)}`);
+    }
+    res.json({ url, saved: await simpanFotoKeDb(req.uid, url) });
   } catch (e) {
     console.log(`[upload] error: ${e.message}`);
     res.status(502).json({ error: "upload gagal: " + e.message });
+  }
+  });
+});
+
+// Simpan URL foto ke Firestore via ADMIN SDK (bypass semua client rules —
+// klien pernah dapat "permission denied" misterius dari rules meski diizinkan).
+async function simpanFotoKeDb(uid, url) {
+  try {
+    const { getFirestore } = require("firebase-admin/firestore");
+    await getFirestore(getAdmin()).collection("users").doc(uid).set({ foto: url }, { merge: true });
+    console.log(`[upload] foto disimpan ke db: ${url.slice(0, 45)}`);
+    return true;
+  } catch (e) {
+    console.log(`[upload] simpan ke db GAGAL: ${e.message}`);
+    return false;
+  }
+}
+
+// ---------- NOTIFIKASI IN-APP (anti-spam) ----------
+// HARDENING: dulu user lain bisa addDoc LANGSUNG ke users/{uid}/notifications
+// (rules: allow create: if auth != null) → spam/injection ke siapa pun.
+// Sekarang semua notif lintas-user lewat endpoint ini: WAJIB login, rate
+// limit per-uid, dan link hanya boleh relative (cuma "/...", bukan URL ekstern).
+const NOTIFY_TYPES = new Set(["REPLY_COMMENT"]);
+const notifyBuckets = new Map();
+
+// ===== Beacon debug pfp (sementara): app lapor hasil simpan foto =====
+  app.post("/pfp-report", async (req, res) => {
+    const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+    if (!token) return res.status(401).json({ error: "token dibutuhkan" });
+    try {
+      const decoded = await getAuth(getAdmin()).verifyIdToken(token);
+      console.log(
+        `[pfp-beacon] uid=${decoded.uid} ok=${req.body?.ok} url=${String(req.body?.url || "").slice(0, 50)} err=${String(req.body?.err || "").slice(0, 120)} ts=${new Date().toISOString().slice(11, 19)}`
+      );
+      res.json({ ok: true });
+    } catch {
+      res.status(401).json({ error: "token tidak valid" });
+    }
+  });
+
+app.post("/notify", async (req, res) => {
+  try {
+    const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+    if (!token) return res.status(401).json({ error: "token dibutuhkan" });
+    let decoded;
+    try {
+      decoded = await getAuth(getAdmin()).verifyIdToken(token);
+    } catch {
+      return res.status(401).json({ error: "token tidak valid" });
+    }
+    const sender = decoded.uid;
+    const now = Date.now();
+    const hits = (notifyBuckets.get(sender) || []).filter((t) => t > now - 60 * 1000);
+    if (hits.length >= 8) {
+      return res.status(429).json({ error: "terlalu banyak notif, tunggu sebentar" });
+    }
+    hits.push(now);
+    notifyBuckets.set(sender, hits);
+
+    const { uid, type, senderName, senderFoto, message, link } = req.body || {};
+    if (!uid || typeof uid !== "string" || uid.length > 64) {
+      return res.status(400).json({ error: "uid wajib" });
+    }
+    if (!NOTIFY_TYPES.has(type)) return res.status(400).json({ error: "type tidak diizinkan" });
+    if (!message || String(message).length > 200) {
+      return res.status(400).json({ error: "message wajib (max 200 karakter)" });
+    }
+    if (uid === sender) {
+      return res.status(400).json({ error: "tidak bisa kirim notif ke diri sendiri" });
+    }
+    let linkStr = String(link || "");
+    if (linkStr && !/^\/(?!\/)/.test(linkStr)) {
+      return res.status(400).json({ error: "link harus path relative (diawali /)" });
+    }
+    linkStr = linkStr.slice(0, 300);
+
+    const { getFirestore } = require("firebase-admin/firestore");
+    await getFirestore(getAdmin())
+      .collection("users")
+      .doc(uid)
+      .collection("notifications")
+      .add({
+        type,
+        senderName: String(senderName || "").slice(0, 40),
+        senderFoto: String(senderFoto || "").slice(0, 300),
+        message: String(message).slice(0, 200),
+        link: linkStr,
+        time: "Baru saja",
+        timestamp: require("firebase-admin/firestore").FieldValue.serverTimestamp(),
+      });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -452,12 +692,19 @@ app.get("/leaderboard", async (req, res) => {
     const uid = String(req.query.uid || "");
     const snap = await adminFs(getAdmin()).collection("users").get();
     const rows = snap.docs
+      // Sembunyikan admin dari papan — level/exp mereka di-set manual,
+      // nggak adil buat hunter lain.
+      .filter((d) => (d.data().role || null) !== "admin")
       .map((d) => {
         const data = d.data();
+        let foto = data.foto || "";
+        // HARDENING: foto bisa data URL base64 gede banget (≈1MB/doc) —
+        // 20 user × 650KB = overload response tiap panggilan. Kecilin.
+        if (foto.length > 4000) foto = "";
         return {
           uid: d.id,
           nama: String(data.nama || "Hunter").slice(0, 40),
-          foto: data.foto || "",
+          foto,
           level: Number(data.level) || 1,
           exp: Number(data.exp) || 0,
         };
@@ -544,7 +791,7 @@ app.get("/db/status", async (_req, res) => {
 // GET /db/status — konfigurasi yang di-fetch app saat start (mis. apiBase animekita
 // terkini). Supaya kalau animekita ganti domain/versi API, cukup update env
 // ANIMEKITA_API_BASE di backend, tanpa rebuild/re-publish app.
-app.get("/admin/cache-bust-ep", async (_req, res) => {
+app.get("/admin/cache-bust-ep", requireAdmin, async (_req, res) => {
   try {
     const keys = await db.keysLike("ep:%");
     for (const k of keys) await db.del(k);
@@ -557,6 +804,7 @@ app.get("/config", async (_req, res) => {
   try {
     res.json({
       apiBase: process.env.ANIMEKITA_API_BASE || adapter.API_BASE,
+      ua: process.env.ANIMEKITA_UA || adapter.UA,
       updatedAt: new Date().toISOString(),
     });
   } catch (e) {

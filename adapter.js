@@ -203,7 +203,7 @@ async function statusList(type, page = 1) {
     return true;
   });
   const start = (page - 1) * 30;
-  const items = known.slice(start, start + 30).map(cardFromList);
+  const items = await Promise.all(known.slice(start, start + 30).map(cardFromListAsync));
   return listOf(type, page, items, known.length);
 }
 
@@ -625,6 +625,37 @@ function cardFromList(it) {
   };
 }
 
+// Versi async: lengkapi kartu dengan metadata dari cache detail `anime:<slug>`
+// (shape animeDetail: synopsis/genres/score; fallback shape raw animekita:
+// sinopsis/genre/rating — dua-duanya bisa muncul). Kalau detail belum ada,
+// kartu tetap normal; nanti keisi otomatis saat halaman detail dibuka.
+async function cardFromListAsync(it) {
+  const card = cardFromList(it);
+  const slug = card.animeId;
+  if (!slug) return card;
+  try {
+    const rec = await db.get(`anime:${slug}`);
+    const d = rec && rec.value;
+    if (!d) return card;
+    const syn = d.synopsis || d.sinopsis;
+    if (!card.synopsis && syn) {
+      const s = String(syn).trim();
+      card.synopsis = s.length > 500 ? s.slice(0, 500) + "…" : s || null;
+    }
+    const gs = Array.isArray(d.genres) ? d.genres : Array.isArray(d.genre) ? d.genre : [];
+    if ((!card.genres || card.genres.length === 0) && gs.length) {
+      card.genres = gs.slice(0, 8);
+    }
+    const sc = normalizeScore(d.score) || normalizeScore(d.rating);
+    if (!card.score && sc) card.score = sc;
+    if (!card.status && d.status) card.status = normalizeStatus(d.status);
+    if (!card.type && d.type) card.type = d.type;
+    const eps = episodeCount(d.totalEpisodes) || episodeCount(d.total_episode) || episodeCount(d.episode);
+    if (!card.episode && eps) card.episode = eps;
+  } catch {}
+  return card;
+}
+
 // Jumlah episode sesungguhnya ada di `total_episode` (angka); `lastch` di animekita
 // sering string kosong/"Episode X" dan gak ada field `episode`. Normalisasi ke Int.
 function episodeCount(v) {
@@ -730,9 +761,9 @@ async function home() {
     cached("home:uploads", 5 * 60 * 1000, () => apiGet("baruupload.php", { page: 1 })),
     cached("home:movie", 10 * 60 * 1000, () => apiGet("movie.php")),
   ]);
-  const recent = (Array.isArray(uploads) ? uploads : []).map((c) => {
+  const recent = (Array.isArray(uploads) ? uploads : []).map(async (c) => {
     const item = {
-      ...cardFromList(c),
+      ...(await cardFromListAsync(c)),
       status: "Ongoing",
       genres: Array.isArray(c.genre) ? c.genre : [],
       synopsis: c.sinopsis || null,
@@ -745,13 +776,13 @@ async function home() {
   });
   const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 10);
   const completedList = (await statusList("completed", 1)).animeList.slice(0, 10);
-  const movieList = (Array.isArray(movie) ? movie : []).map(cardFromList);
+  const movieList = await Promise.all((Array.isArray(movie) ? movie : []).map(cardFromListAsync));
 
-  const allItems = [...recent, ...ongoingList, ...completedList, ...movieList];
+  const allItems = [...(await Promise.all(recent)), ...ongoingList, ...completedList, ...movieList];
   await enrichMissingRatings(allItems);
 
   return {
-    recent,
+    recent: await Promise.all(recent),
     ongoing: { animeList: ongoingList },
     completed: { animeList: completedList },
     film: { animeList: movieList },
@@ -917,7 +948,7 @@ async function complete(page = 1) {
 async function listByType(type, page = 1) {
   if (type === "movie") {
     const d = await cached("movie", 10 * 60 * 1000, () => apiGet("movie.php"));
-    const items = (Array.isArray(d) ? d : []).map(cardFromList);
+    const items = await Promise.all((Array.isArray(d) ? d : []).map(cardFromListAsync));
     return listOf("movie", page, items, items.length);
   }
   const d = await cached(`animeList:${page}`, 15 * 60 * 1000, () =>
@@ -929,51 +960,57 @@ async function listByType(type, page = 1) {
   const start = (page - 1) * 30;
 
   if (type === "donghua") {
-    const items = flat
-      .filter((x) => {
-        const slug = normalizeSlug(x.url || x.link || x.id);
-        return String(STATUS[slug]?.type || "").toLowerCase() === "donghua";
-      })
-      .map(cardFromList);
+    const items = await Promise.all(
+      flat
+        .filter((x) => {
+          const slug = normalizeSlug(x.url || x.link || x.id);
+          return String(STATUS[slug]?.type || "").toLowerCase() === "donghua";
+        })
+        .map(cardFromListAsync)
+    );
     return listOf("donghua", page, items.slice(start, start + 30), items.length);
   }
 
   if (type === "upcoming") {
-    const items = flat
-      .filter((x) => {
-        const slug = normalizeSlug(x.url || x.link || x.id);
-        const s = STATUS[slug]?.s || "";
-        if (/UPCOMING|PENGUMUMAN/i.test(s)) {
-          const title = String(x.title || x.judul || x.anime_name || x.name || "");
-          if (/takedown|\[info\]/i.test(title)) return false;
-          return true;
-        }
-        return false;
-      })
-      .map(cardFromList);
+    const items = await Promise.all(
+      flat
+        .filter((x) => {
+          const slug = normalizeSlug(x.url || x.link || x.id);
+          const s = STATUS[slug]?.s || "";
+          if (/UPCOMING|PENGUMUMAN/i.test(s)) {
+            const title = String(x.title || x.judul || x.anime_name || x.name || "");
+            if (/takedown|\[info\]/i.test(title)) return false;
+            return true;
+          }
+          return false;
+        })
+        .map(cardFromListAsync)
+    );
     return listOf("upcoming", page, items.slice(start, start + 30), items.length);
   }
 
   if (type === "all") {
     // Gabungan ongoing + completed + movie + donghua (buang None/Pengumuman),
     // diacak deterministik biar tiap halaman campur rata.
-    const items = flat
-      .filter((x) => {
-        const slug = normalizeSlug(x.url || x.link || x.id);
-        const t = String(STATUS[slug]?.type || "").toLowerCase();
-        const s = String(STATUS[slug]?.s || "");
-        return t && t !== "none" && !/PENGUMUMAN/i.test(s);
-      })
-      .sort((a, b) => {
-        const ha = hash32(normalizeSlug(a.url || a.link || a.id));
-        const hb = hash32(normalizeSlug(b.url || b.link || b.id));
-        return ha - hb;
-      })
-      .map(cardFromList);
+    const items = await Promise.all(
+      flat
+        .filter((x) => {
+          const slug = normalizeSlug(x.url || x.link || x.id);
+          const t = String(STATUS[slug]?.type || "").toLowerCase();
+          const s = String(STATUS[slug]?.s || "");
+          return t && t !== "none" && !/PENGUMUMAN/i.test(s);
+        })
+        .sort((a, b) => {
+          const ha = hash32(normalizeSlug(a.url || a.link || a.id));
+          const hb = hash32(normalizeSlug(b.url || b.link || b.id));
+          return ha - hb;
+        })
+        .map(cardFromListAsync)
+    );
     return listOf("all", page, items.slice(start, start + 30), items.length);
   }
 
-  return listOf(type, page, flat.slice(start, start + 30).map(cardFromList), flat.length);
+  return listOf(type, page, (await Promise.all(flat.slice(start, start + 30).map(cardFromListAsync))), flat.length);
 }
 
 function hash32(str) {
@@ -989,10 +1026,12 @@ async function byGenre(slug, page = 1) {
   const d = await cached(`genre:${slug}:${page}`, 10 * 60 * 1000, () =>
     apiGet("genreseries.php", { url: slug, page })
   );
-  const items = (Array.isArray(d) ? d : []).map((c) => ({
-    ...cardFromList(c),
-    genres: Array.isArray(c.genre) ? c.genre : [],
-  }));
+  const items = await Promise.all(
+    (Array.isArray(d) ? d : []).map(async (c) => ({
+      ...(await cardFromListAsync(c)),
+      genres: Array.isArray(c.genre) ? c.genre : [],
+    }))
+  );
   return {
     genre: slug,
     page,
@@ -1008,11 +1047,13 @@ async function searchQuery(q) {
     apiGet("search.php", { keyword: q })
   );
   const result = Array.isArray(d.data) ? d.data[0] : null;
-  const items = ((result && result.result) || []).map((c) => ({
-    ...cardFromList(c),
-    genres: Array.isArray(c.genre) ? c.genre : [],
-    synopsis: c.sinopsis || null,
-  }));
+  const items = await Promise.all(
+    ((result && result.result) || []).map(async (c) => ({
+      ...(await cardFromListAsync(c)),
+      genres: Array.isArray(c.genre) ? c.genre : [],
+      synopsis: c.sinopsis || null,
+    }))
+  );
   return { query: q, animeList: items, results: items };
 }
 
@@ -1142,6 +1183,8 @@ module.exports = {
   schedule,
   genres,
   ongoing,
+  cardFromList,
+  cardFromListAsync,
   complete,
   listByType,
   byGenre,
