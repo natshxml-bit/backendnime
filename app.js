@@ -1,7 +1,6 @@
 const express = require("express");
 const adapter = require("./adapter");
 const db = require("./db/db");
-db.del("schedule").catch(()=>{});
 const fs = require("fs");
 const path = require("path");
 
