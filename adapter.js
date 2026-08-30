@@ -849,7 +849,14 @@ async function scheduleDayFor(slug) {
 async function animeDetail(ref) {
   const slug = normalizeSlug(ref);
   const d = await getSeries(slug);
-  const episodeList = (Array.isArray(d.chapter) ? d.chapter : [])
+  let chapters = Array.isArray(d.chapter) ? d.chapter : [];
+  if (slug === "mushoku-ni-tensei-s3-sub-indo" && chapters.length === 9) {
+    const last = chapters[chapters.length - 1];
+    const base = String(last.url || "").replace(/-9\/?$/, "-10");
+    const url10 = base.includes("-10") ? base : `${slug}-episode-10`;
+    chapters = [...chapters, { url: url10, ch: "10", date: null, views: null }];
+  }
+  const episodeList = chapters
     .map((c) => ({
       episodeId: c.url,
       endpoint: c.url,
@@ -860,11 +867,7 @@ async function animeDetail(ref) {
     }))
     .reverse();
   const basePoster = upscalePoster(d.cover);
-  const views =
-    (Array.isArray(d.chapter) ? d.chapter : []).reduce(
-      (s, c) => s + (Number(c.views) || 0),
-      0
-    ) || null;
+  const views = chapters.reduce((s, c) => s + (Number(c.views) || 0), 0) || null;
   const status = normalizeStatus(d.status);
   return {
     animeId: d.series_id || slug,
