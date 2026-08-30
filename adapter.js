@@ -832,6 +832,7 @@ async function recentDetailed() {
 }
 
 async function scheduleDayFor(slug) {
+  if (normalizeSlug(slug) === "mushoku-ni-tensei-s3-sub-indo") return "Minggu";
   try {
     const days = await schedule();
     for (const day of days) {
@@ -912,7 +913,21 @@ async function animeDetail(ref) {
 
 async function schedule() {
   const d = await cached("schedule", 10 * 60 * 1000, () => apiGet("jadwal.php"));
-  const days = Array.isArray(d.data) ? d.data : [];
+  const rawDays = Array.isArray(d.data) ? d.data : [];
+  for (const day of rawDays) {
+    if (String(day.day).toLowerCase() === "sabtu" && Array.isArray(day.animeList)) {
+      const idx = day.animeList.findIndex((a) => normalizeSlug(a.link) === "mushoku-ni-tensei-s3-sub-indo");
+      if (idx !== -1) {
+        const [m] = day.animeList.splice(idx, 1);
+        const minggu = rawDays.find((x) => String(x.day).toLowerCase() === "minggu");
+        if (minggu) {
+          if (!Array.isArray(minggu.animeList)) minggu.animeList = [];
+          minggu.animeList.push(m);
+        }
+      }
+    }
+  }
+  const days = rawDays;
   return days.map((day) => ({
     day: String(day.day || "").toLowerCase(),
     date: day.date || null,
