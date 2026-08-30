@@ -846,10 +846,28 @@ async function scheduleDayFor(slug) {
   return null;
 }
 
+async function tryOtakudesuEpisodes(slug) {
+  try {
+    const html = await fetch(`https://otakudesu.lol/anime/${slug}/`, { headers: { "User-Agent": "Mozilla/5.0", Referer: "https://otakudesu.lol/" } }).then((r) => (r.ok ? r.text() : ""));
+    if (!html) return null;
+    const eps = [];
+    const re = /href="https:\/\/otakudesu\.lol\/episode\/([^"]+)"[^>]*>[^<]*Episode\s+(\d+)/gi;
+    let m;
+    while ((m = re.exec(html))) eps.push({ url: m[1], ep: parseInt(m[2], 10) });
+    if (!eps.length) return null;
+    eps.sort((a, b) => a.ep - b.ep);
+    return eps.map((e) => ({ url: e.url, ch: String(e.ep), date: null, views: null }));
+  } catch { return null; }
+}
+
 async function animeDetail(ref) {
   const slug = normalizeSlug(ref);
   const d = await getSeries(slug);
   let chapters = Array.isArray(d.chapter) ? d.chapter : [];
+  if (!chapters.length) {
+    const ot = await tryOtakudesuEpisodes(slug);
+    if (ot && ot.length) chapters = ot;
+  }
   if (slug === "mushoku-ni-tensei-s3-sub-indo" && chapters.length === 9) {
     const last = chapters[chapters.length - 1];
     const base = String(last.url || "").replace(/-9\/?$/, "-10");
