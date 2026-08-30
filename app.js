@@ -1,7 +1,6 @@
 const express = require("express");
 const adapter = require("./adapter");
 const db = require("./db/db");
-db.del("anime:mushoku-ni-tensei-s3-sub-indo").catch(()=>{});
 const fs = require("fs");
 const path = require("path");
 
