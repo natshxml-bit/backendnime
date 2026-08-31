@@ -996,15 +996,21 @@ async function listByType(type, page = 1) {
   const start = (page - 1) * 30;
 
   if (type === "donghua") {
-    const items = await Promise.all(
-      flat
-        .filter((x) => {
-          const slug = normalizeSlug(x.url || x.link || x.id);
-          return String(STATUS[slug]?.type || "").toLowerCase() === "donghua";
-        })
-        .map(cardFromListAsync)
+    const cands = flat.slice(0, 90);
+    const checks = await Promise.all(
+      cands.map(async (x) => {
+        const slug = normalizeSlug(x.url || x.link || x.id);
+        if (String(STATUS[slug]?.type || "").toLowerCase() === "donghua") return x;
+        try {
+          const s = await getSeries(slug);
+          if (String(s.type || "").toLowerCase() === "donghua") return x;
+        } catch {}
+        return null;
+      })
     );
-    return listOf("donghua", page, items.slice(start, start + 30), items.length);
+    const filtered = checks.filter(Boolean);
+    const items = await Promise.all(filtered.map(cardFromListAsync));
+    return listOf("donghua", page, items.slice(start, start + 30), filtered.length);
   }
 
   if (type === "upcoming") {
