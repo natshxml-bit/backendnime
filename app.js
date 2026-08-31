@@ -113,10 +113,7 @@ app.use("/proxy", proxyRateLimit);
 const VALID_LISTS = ["all", "ongoing", "finished", "upcoming", "movie", "donghua", "anime"];
 
 app.get("/", (_req, res) => {
-  res.json({
-    name: "TsukiNime API",
-    version: "3.0.0",
-  });
+  res.status(204).end();
 });
 
 // status watcher: baca heartbeat yang ditulis watcher tiap tick
