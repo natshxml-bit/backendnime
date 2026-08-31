@@ -688,11 +688,7 @@ app.get("/leaderboard", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
     const uid = String(req.query.uid || "");
     const snap = await adminFs(getAdmin()).collection("users").get();
-    const rows = snap.docs
-      // Sembunyikan admin dari papan — level/exp mereka di-set manual,
-      // nggak adil buat hunter lain.
-      .filter((d) => (d.data().role || null) !== "admin")
-      .map((d) => {
+    const rows = snap.docs.map((d) => {
         const data = d.data();
         let foto = data.foto || "";
         // HARDENING: foto bisa data URL base64 gede banget (≈1MB/doc) —
