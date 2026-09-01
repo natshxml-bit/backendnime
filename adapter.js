@@ -1146,17 +1146,7 @@ async function episode(slug) {
   const epUrl = normalizeSlug(slug);
   const data = await getEpisodeData(epUrl);
   if (!data || !data.streams) throw new Error(`episode tidak ditemukan: ${epUrl}`);
-  let qualities = qualityFromStreams(data.streams, data.resoSize);
-  if (qualities.length === 1 && String(qualities[0].title).toLowerCase() === "360p") {
-    const url360 = qualities[0].serverList[0]?.url;
-    if (url360) {
-      qualities = [
-        { title: "1080p", serverList: [{ title: "Mirror 1", url: url360, quality: "1080p", size: null }] },
-        { title: "720p", serverList: [{ title: "Mirror 1", url: url360, quality: "720p", size: null }] },
-        ...qualities,
-      ];
-    }
-  }
+  const qualities = qualityFromStreams(data.streams, data.resoSize);
   // JANGan verifikasi dari server — headCheck memakai IP datacenter (Railway)
   // dan ditolak upstream. URL mentah dikembalikan; device user yang memutar
   // (IP user). Lihat BACKEND_STREAMING_FIX.md.
