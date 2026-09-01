@@ -1151,8 +1151,8 @@ async function episode(slug) {
     const url360 = qualities[0].serverList[0]?.url;
     if (url360) {
       qualities = [
-        { title: "1080p", serverList: [{ title: "Mirror 1 (Otakudesu)", url: url360, quality: "1080p", size: null }] },
-        { title: "720p", serverList: [{ title: "Mirror 1 (Otakudesu)", url: url360, quality: "720p", size: null }] },
+        { title: "1080p", serverList: [{ title: "Mirror 1", url: url360, quality: "1080p", size: null }] },
+        { title: "720p", serverList: [{ title: "Mirror 1", url: url360, quality: "720p", size: null }] },
         ...qualities,
       ];
     }
