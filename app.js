@@ -4,6 +4,42 @@ const db = require("./db/db");
 const fs = require("fs");
 const path = require("path");
 
+// Mini ranks module (mirror lib/ranks.ts) — pakai untuk konsistensi leaderboard
+// dengan profile (yang derive level dari totalXp). Kalau profile derive Lv 50
+// dari totalXp tapi Firestore level field masih 1 (stale), backend leaderboard
+// juga akan derive Lv 50 → sinkron.
+const MAX_LEVEL = 200;
+function getNextLevelXp(lvl) {
+  if (lvl >= MAX_LEVEL) return Infinity;
+  if (lvl >= 150) return 1800;
+  if (lvl >= 100) return 1200;
+  if (lvl >= 75) return 800;
+  if (lvl >= 50) return 500;
+  if (lvl >= 25) return 300;
+  if (lvl >= 15) return 180;
+  if (lvl >= 5) return 120;
+  return 80;
+}
+const TOTAL_XP_TO_REACH_LEVEL = (() => {
+  const arr = new Array(MAX_LEVEL + 1).fill(0);
+  let acc = 0;
+  for (let i = 0; i < MAX_LEVEL; i++) {
+    acc += getNextLevelXp(i);
+    arr[i + 1] = acc;
+  }
+  return arr;
+})();
+function getLevelFromTotalXp(totalXp) {
+  const xp = Math.max(0, Math.floor(Number(totalXp) || 0));
+  let lo = 0, hi = MAX_LEVEL, found = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (TOTAL_XP_TO_REACH_LEVEL[mid] <= xp) { found = mid; lo = mid + 1; }
+    else { hi = mid - 1; }
+  }
+  return Math.max(1, found);
+}
+
 process.on("unhandledRejection", (e) => {
   console.error("[app] unhandledRejection:", e && e.stack ? e.stack : e);
 });
@@ -694,15 +730,51 @@ app.get("/leaderboard", async (req, res) => {
         // HARDENING: foto bisa data URL base64 gede banget (≈1MB/doc) —
         // 20 user × 650KB = overload response tiap panggilan. Kecilin.
         if (foto.length > 4000) foto = "";
+        // Fallback ke fotoData (base64 backup) kalau foto URL kosong —
+        // dipakai user yang upload PP tanpa sempat simpan URL ke Firestore
+        // atau yang `user.photoURL` dari Firebase Auth kosong (login Google
+        // tanpa photo / email-password). fotoData juga di-trim supaya
+        // response gak meledak.
+        if (!foto) {
+          const fd = String(data.fotoData || "");
+          if (fd && fd.length <= 4000) foto = fd;
+        }
         return {
           uid: d.id,
           nama: String(data.nama || "Hunter").slice(0, 40),
           foto,
-          level: Number(data.level) || 1,
-          exp: Number(data.exp) || 0,
+          // Derive level dari totalXp agar konsisten dengan profile (yg display
+          // pakai getLevelFromTotalXp). Firestore level field bisa stale
+          // (legacy), jadi recalc di sini. Simpan juga `realLevel` untuk
+          // self-heal patch di bawah.
+          realLevel: getLevelFromTotalXp(Number(data.totalXp ?? data.exp) || 0),
+          level: getLevelFromTotalXp(Number(data.totalXp ?? data.exp) || 0),
+          // Sistem XP kumulatif: pakai totalXp (fallback ke exp legacy).
+          totalXp: Number(data.totalXp ?? data.exp) || 0,
         };
       })
-      .sort((a, b) => b.level - a.level || b.exp - a.exp);
+      // Sort: totalXp desc sebagai primary (konsisten dengan profile yang derive
+      // level dari totalXp), level field jadi tiebreaker saja. Sebelumnya sort
+      // pakai `b.level - a.level` primary, tapi level field bisa stale
+      // (legacy) sehingga leaderboard tidak cocok dengan profile.
+      .sort((a, b) => b.totalXp - a.totalXp || b.level - a.level);
+
+    // Self-heal: kalau Firestore `level` field stale (deviation > 1 dari
+    // derived getLevelFromTotalXp), patch background. Monotonik (tidak
+    // pernah menurunkan level user). Non-blocking — leaderboard response
+    // tidak tunggu. Cegah spam write kalau banyak user stale (max 5 patch
+    // per panggilan).
+    const batch = adminFs(getAdmin()).batch();
+    let healCount = 0;
+    for (const r of rows) {
+      if (Math.abs(r.level - r.realLevel) > 1 && healCount < 5) {
+        const ref = adminFs(getAdmin()).collection("users").doc(r.uid);
+        batch.update(ref, { level: r.realLevel });
+        healCount++;
+      }
+    }
+    if (healCount > 0) batch.commit().catch(() => {});
+
     const top = rows.slice(0, limit);
     let myRank = null;
     if (uid) {
