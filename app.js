@@ -896,6 +896,7 @@ app.get("/config", async (_req, res) => {
 const { Readable } = require("stream");
 const moov = require("./moov");
 const proxyCache = require("./proxyCache");
+const remuxMod = require("./remux");
 const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;
 
 app.get("/proxy", async (req, res) => {
@@ -911,6 +912,60 @@ app.get("/proxy", async (req, res) => {
   }
   if (!PROXY_ALLOWED.test(upstreamUrl.hostname)) {
     return res.status(403).json({ error: "domain tidak diizinkan" });
+  }
+
+  // Remux mode: convert MP4 ke faststart (moov di awal). Dipakai untuk
+  // pixeldrain MP4 yang moov-nya di akhir — tanpa faststart, <video> element
+  // WebView stuck download full file sebelum play. AnimeLovers V3 pakai ExoPlayer
+  // cache yang probe seluruh file; kita pakai ffmpeg remux one-time + cache disk.
+  if (req.query.remux === "1" || req.query.remux === "true") {
+    if (remuxMod.isCached(String(raw))) {
+      const fp = remuxMod.cachePath(String(raw));
+      const stat = fs.statSync(fp);
+      res.set({
+        "Content-Type": "video/mp4",
+        "Content-Length": String(stat.size),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": "inline",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+        "X-Remux-Cache": "HIT",
+        "Cache-Control": "public, max-age=3600",
+      });
+      const range = req.headers.range;
+      if (range) {
+        const m = /^bytes=(\d*)-(\d*)/.exec(range);
+        const start = m && m[1] ? parseInt(m[1], 10) : 0;
+        const end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+        if (start < stat.size) {
+          const e = Math.min(end, stat.size - 1);
+          const stream = fs.createReadStream(fp, { start, end: e });
+          res.status(206);
+          res.set("Content-Range", `bytes ${start}-${e}/${stat.size}`);
+          return stream.pipe(res);
+        }
+      }
+      res.status(200);
+      return fs.createReadStream(fp).pipe(res);
+    }
+    try {
+      const fp = await remuxMod.remux(String(raw));
+      const stat = fs.statSync(fp);
+      res.set({
+        "Content-Type": "video/mp4",
+        "Content-Length": String(stat.size),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": "inline",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+        "X-Remux-Cache": "MISS",
+        "Cache-Control": "public, max-age=3600",
+      });
+      res.status(200);
+      return fs.createReadStream(fp).pipe(res);
+    } catch (e) {
+      console.warn(`[proxy remux] gagal: ${e.message}, fallback stream`);
+    }
   }
 
   let cached = moov.get(String(raw));
