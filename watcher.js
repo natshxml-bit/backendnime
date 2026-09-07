@@ -21,13 +21,22 @@ const API_KEY_QS = process.env.APP_API_KEY
 // harus URL domain publik (bukan 127.0.0.1). Gambar di-proxy lewat /img
 // biar gak ditolak fetcher FCM.
 const PUBLIC_BASE = process.env.PUBLIC_BASE || "https://backendnime.up.railway.app";
-const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "10", 10) * 60 * 1000;
+const POLL_MS = parseInt(process.env.WATCH_INTERVAL_MIN || "15", 10) * 60 * 1000;
 const COOLDOWN_MS = 10 * 60 * 1000;
 // notif hanya untuk rilis yang updated-nya ≤ RECENT_HOURS jam terakhir (anti
 // "rombongan": catch-up setelah watcher mati/restart cukup di-baseline diam-diam)
 const RECENT_MS = parseInt(process.env.WATCH_RECENT_HOURS || "48", 10) * 3600 * 1000;
-// maks notif per tick — sisanya di-defer ke tick berikutnya (anti spam massal)
-const MAX_NOTIF_PER_TICK = parseInt(process.env.WATCH_MAX_PER_TICK || "5", 10);
+// maks episode baru yang di-broadcast per tick (sisanya di-defer ke tick berikutnya)
+const MAX_NOTIF_PER_TICK = parseInt(process.env.WATCH_MAX_PER_TICK || "20", 10);
+// jeda antar notif kalau 1 tick mendeteksi banyak episode sekaligus (mis. 5
+// anime bareng → kirim 1, tunggu STAGGER_MS, kirim berikutnya, dst). 0 = kirim
+// bareng (kembali ke perilaku lama). Default 90 detik.
+const STAGGER_MS = parseInt(process.env.WATCH_STAGGER_MS || "90", 10) * 1000;
+// TTL cooldown persistent (Firestore) untuk episode yang sudah di-notif.
+// Cegah double-fire kalau Railway restart di tengah window.
+const NOTIFIED_TTL_MS = 7 * 24 * 3600 * 1000;
+// collapse_key seragam agar FCM/Android/iOS merge notif yg di-retry
+const COLLAPSE_KEY = process.env.WATCH_COLLAPSE_KEY || "weekly_digest";
 
 function loadCredential() {
   if (fs.existsSync(SERVICE_ACCOUNT)) {
@@ -95,9 +104,11 @@ if (!cred) {
 const isTestMode =
   process.argv.includes("--test") ||
   process.argv.includes("--test-eps") ||
+  process.argv.includes("--test-staggered") ||
   process.argv.includes("--dry-schedule") ||
   process.argv.some((a) => a.startsWith("--test-anime=")) ||
-  process.argv.some((a) => a.startsWith("--dry-schedule="));
+  process.argv.some((a) => a.startsWith("--dry-schedule=")) ||
+  process.argv.some((a) => a.startsWith("--test-staggered="));
 
 if (!isTestMode) {
   if (!acquireLock()) process.exit(0);
@@ -252,6 +263,39 @@ async function getScheduleMap() {
   }
 }
 
+// Cache set animeId yang MASIH ongoing (muncul di /list/ongoing?page=1..N).
+// Dipakai untuk skip notif anime finished/Completed walau secara teknis
+// episode count-nya naik. Refresh tiap 6 jam, in-memory per proses.
+let ongoingSlugsCache = { slugs: null, at: 0 };
+const ONGOING_TTL_MS = 6 * 3600 * 1000;
+const ONGOING_MAX_PAGES = 5; // biasanya ≤ 3 page; lebihkan supaya aman
+async function loadOngoingSlugs() {
+  if (Date.now() - ongoingSlugsCache.at < ONGOING_TTL_MS && ongoingSlugsCache.slugs) {
+    return ongoingSlugsCache.slugs;
+  }
+  const slugs = new Set();
+  for (let p = 1; p <= ONGOING_MAX_PAGES; p++) {
+    try {
+      const res = await fetch(`${API_BASE}/list/ongoing?page=${p}${API_KEY_QS}`, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) break;
+      const data = await res.json();
+      const list = Array.isArray(data?.animeList) ? data.animeList : Array.isArray(data) ? data : [];
+      if (list.length === 0) break;
+      for (const it of list) {
+        if (it && it.animeId) slugs.add(String(it.animeId));
+      }
+      if (list.length < 20) break; // page terakhir
+    } catch {
+      break;
+    }
+  }
+  if (slugs.size > 0) {
+    ongoingSlugsCache = { slugs, at: Date.now() };
+    console.log(`[watcher] ongoing slugs dimuat (${slugs.size} anime)`);
+  }
+  return slugs;
+}
+
 // Notif hanya kalau judulnya ADA di jadwal rilis DAN rilisnya cocok jadwal:
 // hari rilisnya = hari ini WIB, ATAU jadwal mencatat updated < 48 jam lalu
 // (antisipasi upload telat 1 hari). Kalau jadwal gagal dimuat (null) →
@@ -284,6 +328,34 @@ async function getRecent() {
 async function getAllUsers() {
   const snap = await db.collection("users").get();
   return snap.docs.map((d) => ({ id: d.id, data: d.data() }));
+}
+
+// COOLDOWN PERSISTENT — kalau episode (animeId, ep) sudah pernah di-notify,
+// skip di tick berikut (meskipun watcher restart). Cegah double-fire setelah
+// Railway restart / redeploy. Pakai TTL 7 hari biar koleksi tidak membengkak.
+const NOTIFIED_COL = "_system/notifyLog";
+function notifiedDocId(animeId, ep) {
+  return `${String(animeId).replace(/[^\w-]/g, "_")}:${ep}`;
+}
+async function isEpisodeNotified(animeId, ep) {
+  try {
+    const snap = await db.doc(`${NOTIFIED_COL}/${notifiedDocId(animeId, ep)}`).get();
+    if (!snap.exists) return false;
+    const at = snap.get("at");
+    const ts = at && typeof at.toMillis === "function" ? at.toMillis() : at?.seconds * 1000;
+    if (ts && Date.now() - ts > NOTIFIED_TTL_MS) return false; // TTL habis
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function markEpisodeNotified(animeId, ep) {
+  try {
+    await db.doc(`${NOTIFIED_COL}/${notifiedDocId(animeId, ep)}`).set(
+      { at: FieldValue.serverTimestamp(), animeId: String(animeId), ep },
+      { merge: true }
+    );
+  } catch {}
 }
 
 // token valid = string, unik. Token berbentuk object (bug app lama) dibuang.
@@ -327,6 +399,8 @@ async function saveSnapshot() {
 }
 
 async function notifyEpisode(anime, ep, users, tokens) {
+  // Per-anime broadcast (1 notif 1 pesan) — dipanggil oleh scheduleStaggered()
+  // dengan jeda STAGGER_MS, atau langsung oleh mode test (--test-eps dll).
   const animeId = anime.animeId || anime.id;
   const title = cleanTitle(anime.title || anime.name);
   const poster = anime.poster || anime.thumb || "";
@@ -367,8 +441,14 @@ async function notifyEpisode(anime, ep, users, tokens) {
           body,
           ...(posterImg ? { image: posterImg } : {}),
         },
-        android: { priority: "high", notification: { channelId: "episode_rilis" } },
-        data: { animeId: String(animeId), url: link, poster: poster || "" },
+        android: {
+          priority: "high",
+          collapse_key: COLLAPSE_KEY,
+          notification: { channelId: "episode_rilis" },
+        },
+        apns: { headers: { "apns-collapse-id": COLLAPSE_KEY } },
+        webpush: { headers: { Topic: COLLAPSE_KEY } },
+        data: { animeId: String(animeId), url: link, poster: poster || "", type: "SINGLE" },
       });
       const invalid = new Set();
       resp.responses.forEach((r, idx) => {
@@ -394,6 +474,37 @@ async function notifyEpisode(anime, ep, users, tokens) {
   }
 }
 
+// STAGGERED SEND — kirim 1 FCM per episode dengan jeda STAGGER_MS antar
+// notif. Kalau ada 5 episode baru di 1 tick → notif ke-1 langsung, ke-2
+// setelah STAGGER_MS, dst. Cooldown persistent (Firestore) mencegah
+// re-fire kalau container restart di tengah antrian.
+// items: [{ animeId, ep, title, poster, slug }]
+function scheduleStaggered(items, users, tokens) {
+  if (items.length === 0) return;
+  if (STAGGER_MS <= 0) {
+    // mode lama: kirim bareng (tanpa jeda)
+    (async () => {
+      for (const it of items) {
+        try {
+          await notifyEpisode({ animeId: it.animeId, title: it.title, poster: it.poster }, it.ep, users, tokens);
+        } catch (e) { console.error("[watcher] FCM gagal:", e.message); }
+      }
+    })();
+    return;
+  }
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const delay = i * STAGGER_MS;
+    setTimeout(async () => {
+      console.log(`[watcher] FCM stagger kirim #${i + 1}/${items.length} (delay ${delay / 1000}s): ${cleanTitle(it.title)} EP ${it.ep}`);
+      try {
+        await notifyEpisode({ animeId: it.animeId, title: it.title, poster: it.poster }, it.ep, users, tokens);
+      } catch (e) { console.error("[watcher] FCM gagal:", e.message); }
+    }, delay);
+  }
+  console.log(`[watcher] FCM stagger antrian: ${items.length} notif, jeda ${STAGGER_MS / 1000}s (selesai dalam ${((items.length - 1) * STAGGER_MS) / 1000}s)`);
+}
+
 let ticking = false;
 async function tick() {
   if (ticking) return; // cegah tick bertumpuk (tick lama belum selesai)
@@ -404,44 +515,75 @@ async function tick() {
     await cleanupTokenJunk(users);
     const now = Date.now();
     const scheduleMap = await getScheduleMap();
+    const ongoingSlugs = await loadOngoingSlugs();
     const newEpisodes = [];
 
     // DETEKSI: HANYA dari jadwal rilis (/schedule), sesuai kebijakan — feed
     // upload terbaru TIDAK dipakai sebagai sumber notif (bisa backlog/re-upload).
     // Slug jadwal yang "palsu" di-resolve ke slug kanonik via search.
     if (scheduleMap) {
-      await collectScheduleReleases(scheduleMap, now, newEpisodes);
+      await collectScheduleReleases(scheduleMap, now, newEpisodes, ongoingSlugs);
     } else {
       console.log("[watcher] jadwal gagal dimuat — deteksi dilewati tick ini");
     }
 
     if (newEpisodes.length > 0 && baselineDone) {
-      let sent = 0;
-      let deferred = 0;
+      // KUMPULKAN episode baru per tick → STAGGERED SEND (1 FCM per anime
+      // dengan jeda STAGGER_MS). Bukan 1 pesan gabung (digest) — user lebih
+      // suka notif terpisah, asal tidak dikirim bareng. Filter pakai cooldown
+      // in-memory (10 mnt) + cooldown persistent Firestore (anti re-fire
+      // setelah restart).
+      const staggerItems = [];
+      const deferred = [];
       for (const c of newEpisodes) {
         const animeId = c.anime.animeId || c.anime.id;
-        if (sent >= MAX_NOTIF_PER_TICK) {
-          // defer: baseline TIDAK di-update → terdeteksi lagi tick berikutnya
-          deferred++;
+        if (staggerItems.length >= MAX_NOTIF_PER_TICK) {
+          // cap total tick (anti lonjakan besar) — sisanya di-defer
+          deferred.push(c);
           continue;
         }
         if (now - (lastNotified[animeId] || 0) < COOLDOWN_MS) {
-          // baru saja dinotifikasi (cooldown) — tutup baseline, jangan notif ulang
+          // baru saja dinotifikasi tick ini — tutup baseline, jangan notif ulang
+          maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
+          continue;
+        }
+        // cek cooldown persistent (Firestore) — skip kalau sudah pernah di-notify
+        if (await isEpisodeNotified(animeId, c.ep)) {
+          lastNotified[animeId] = now;
           maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
           continue;
         }
         lastNotified[animeId] = now;
-        sent++;
-        console.log(
-          `[watcher] Episode baru terdeteksi: ${cleanTitle(c.anime.title)} EP ${c.ep}`
-        );
-        await notifyEpisode(c.anime, c.ep, users, tokens);
+        staggerItems.push({
+          animeId,
+          ep: c.ep,
+          title: c.anime.title || animeId,
+          poster: c.anime.poster || "",
+          slug: animeId,
+        });
         maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
       }
-      if (deferred > 0) {
+      if (staggerItems.length > 0) {
+        for (const it of staggerItems) {
+          console.log(`[watcher] Episode baru: ${cleanTitle(it.title)} EP ${it.ep}`);
+        }
+        // schedule staggered (tidak await — fire-and-forget biar tick cepat selesai)
+        scheduleStaggered(staggerItems, users, tokens);
+        // catat di Firestore supaya restart berikutnya skip
+        await Promise.allSettled(staggerItems.map((it) => markEpisodeNotified(it.animeId, it.ep)));
+      } else {
+        console.log(`[watcher] tidak ada rilis baru yg perlu di-notify (${newEpisodes.length} kandidat, semua di-cooldown)`);
+      }
+      if (deferred.length > 0) {
         console.log(
-          `[watcher] ${deferred} rilis di-defer ke tick berikutnya (maks ${MAX_NOTIF_PER_TICK}/tick)`
+          `[watcher] ${deferred.length} rilis di-defer ke tick berikutnya (maks ${MAX_NOTIF_PER_TICK}/tick)`
         );
+        // tetap update baseline supaya tidak spam log di tick berikut (akan
+        // di-skip oleh cooldown Firestore kalau ada)
+        for (const c of deferred) {
+          const animeId = c.anime.animeId || c.anime.id;
+          maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
+        }
       }
     } else {
       console.log(
@@ -470,7 +612,7 @@ async function tick() {
 // Rilis lama setelah watcher mati lama → cukup di-baseline diam-diam
 // (update snapshot tanpa FCM) biar nggak jadi rombongan notif.
 // MAX_NOTIF_PER_TICK jadi pengaman terakhir di tick().
-async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
+async function collectScheduleReleases(scheduleMap, now, newEpisodes, ongoingSlugs) {
   const FRESH_MS = 7 * 24 * 3600 * 1000;
   const MAX_JUMP = 2;
   const entries = Object.entries(scheduleMap);
@@ -478,13 +620,13 @@ async function collectScheduleReleases(scheduleMap, now, newEpisodes) {
   const workers = Array.from({ length: Math.min(8, entries.length) }, async () => {
     while (i < entries.length) {
       const [slug, sched] = entries[i++];
-      await checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP);
+      await checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP, ongoingSlugs);
     }
   });
   await Promise.all(workers);
 }
 
-async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP) {
+async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_JUMP, ongoingSlugs) {
   try {
     let s = sched.canonical || slug;
     let schedUpdated = Number(sched.updated || 0);
@@ -501,6 +643,14 @@ async function checkScheduleAnime(slug, sched, now, newEpisodes, FRESH_MS, MAX_J
       }
     }
     if (!(ep > 0)) return;
+
+    // FILTER ONGOING: skip anime yang sudah finished/Completed. Kalau daftar
+    // ongoing kosong (cache belum ready) → fallback allow (tidak skip).
+    if (ongoingSlugs && ongoingSlugs.size > 0 && !ongoingSlugs.has(s)) {
+      // update baseline supaya tidak di-cek lagi (selama tidak ongoing)
+      maxByAnime[s] = { u: schedUpdated, e: ep };
+      return;
+    }
 
     const prev = maxByAnime[s];
     const prevE = (prev && typeof prev === "object" ? prev.e : prev) || 0;
@@ -636,7 +786,8 @@ async function sendTestScheduleDry(pokeSlug) {
     console.log(`[watcher] --dry-schedule poke: ${pokeSlug} snapshot di-set ke EP ${Math.max(0, cur - 1)} (simulasi rilis baru)`);
   }
   const newEpisodes = [];
-  await collectScheduleReleases(scheduleMap, Date.now(), newEpisodes);
+  const ongoingSlugs = await loadOngoingSlugs();
+  await collectScheduleReleases(scheduleMap, Date.now(), newEpisodes, ongoingSlugs);
   if (newEpisodes.length === 0) {
     console.log("[watcher] dry-run: TIDAK ADA rilis baru dari jadwal");
   } else {
@@ -647,8 +798,82 @@ async function sendTestScheduleDry(pokeSlug) {
   console.log(`[watcher] dry-run selesai (${newEpisodes.length} notif, snapshot TIDAK diubah)`);
 }
 
+// helper: filter users ke 1 user spesifik. Untuk test mode supaya tidak
+// ganggu user lain. Priority (yang pertama match dipakai):
+//   1. toDoc  = Firestore docId (paling stabil & precise)
+//   2. toEmail= exact email match
+//   3. toUid  = users.uid field
+//   4. toToken= cari user doc yang punya token FCM itu (exact match)
+// toTokens = kalau true, return hanya token yg match toToken (bukan semua
+// token user). Penting supaya kalau natshxml & iznatshi punya token sama,
+// FCM tidak double-fire.
+async function getTestUser({ toDoc, toEmail, toUid, toToken } = {}) {
+  const all = await getAllUsers();
+  if (!toDoc && !toEmail && !toUid && !toToken) return all;
+
+  const match = (u) => {
+    const d = u.data || {};
+    if (toDoc && u.id === toDoc) return true;
+    if (toEmail && String(d.email || "").toLowerCase() === toEmail.toLowerCase()) return true;
+    if (toUid && (d.uid === toUid || u.id === toUid)) return true;
+    if (toToken && Array.isArray(d.fcmTokens) && d.fcmTokens.includes(toToken)) return true;
+    return false;
+  };
+  const found = all.find(match);
+  if (!found) {
+    console.log(`[watcher] --to-*: user TIDAK ditemukan (${all.length} user terdaftar, filter: doc=${toDoc || "-"} email=${toEmail || "-"} uid=${toUid || "-"} token=${toToken ? toToken.slice(0, 20) + "..." : "-"})`);
+    return [];
+  }
+  const label = found.data?.email || found.id;
+  console.log(`[watcher] --to-*: kirim HANYA ke ${found.id} (${label})`);
+  if (toToken && Array.isArray(found.data.fcmTokens) && found.data.fcmTokens.includes(toToken)) {
+    // restrict user object ke 1 token saja (no double-fire kalau token
+    // juga tersimpan di user doc lain)
+    return [{ id: found.id, data: { ...found.data, fcmTokens: [toToken] } }];
+  }
+  return [found];
+}
+
+// test mode STAGGERED: ambil N item dari /watcher-feed, kirim via
+// scheduleStaggered — verifikasi flow notif per-anime dgn jeda STAGGER_MS.
+// Optional: kirim HANYA ke 1 user (--to-me=email|uid) supaya tidak spam user lain.
+async function sendTestStaggered(count = 3, opts = {}) {
+  // Default ke TEST_TO_DOC / TEST_TO_EMAIL / TEST_TO_TOKEN env. Prioritas:
+  // DOC > EMAIL > TOKEN (semua opt-in; kalau env set, otomatis scope test).
+  const toDoc = opts.toDoc || process.env.TEST_TO_DOC || null;
+  const toEmail = opts.toEmail || process.env.TEST_TO_EMAIL || null;
+  const toToken = opts.toToken || process.env.TEST_TO_TOKEN || null;
+  const users = await getTestUser({ toDoc, toEmail, toToken });
+  if (users.length === 0) return console.log("[watcher] --test-staggered: tidak ada user target");
+  const tokens = collectTokens(users);
+  let feed = [];
+  try {
+    const res = await fetch(`${API_BASE}/watcher-feed${API_KEY_QS}`, { signal: AbortSignal.timeout(30000) });
+    if (res.ok) feed = await res.json();
+  } catch {}
+  const items = (Array.isArray(feed) ? feed : [])
+    .filter((x) => x && x.animeId && Number(x.episode) > 0 && x.title)
+    .slice(0, count)
+    .map((x) => ({
+      animeId: x.animeId,
+      ep: Number(x.episode),
+      title: x.title,
+      poster: x.poster || "",
+      slug: x.animeId,
+    }));
+  if (items.length === 0) return console.log("[watcher] --test-staggered: feed kosong/tanpa episode");
+  console.log(`[watcher] --test-staggered: ${items.length} item (${users.length} user, ${tokens.length} token)`);
+  for (const it of items) console.log(`  - ${cleanTitle(it.title)} EP ${it.ep}`);
+  scheduleStaggered(items, users, tokens);
+  // tunggu supaya setTimeout fire & log tercetak
+  const waitMs = (items.length * STAGGER_MS) + 5000;
+  await new Promise((r) => setTimeout(r, waitMs));
+  console.log(`[watcher] --test-staggered selesai (antrian ${items.length} notif, total ${waitMs / 1000}s)`);
+}
+
 const testAnimeArg = process.argv.find((a) => a.startsWith("--test-anime="));
 const dryScheduleArg = process.argv.find((a) => a.startsWith("--dry-schedule="));
+const testStaggeredArg = process.argv.find((a) => a.startsWith("--test-staggered"));
 if (dryScheduleArg) {
   const pokeSlug = dryScheduleArg.split("=")[1].replace(/^poke:/, "");
   sendTestScheduleDry(dryScheduleArg.split("=")[1].startsWith("poke:") ? pokeSlug : undefined)
@@ -664,6 +889,20 @@ if (dryScheduleArg) {
   sendTestAnime(slug).then(() => process.exit(0));
 } else if (process.argv.includes("--test-eps")) {
   sendTestLastEps().then(() => process.exit(0));
+} else if (testStaggeredArg) {
+  const n = parseInt(testStaggeredArg.split("=")[1] || "3", 10) || 3;
+  // support beberapa flag scoping: --to-doc=UID, --to-email=ADDR, --to-token=TOKEN
+  // (CLI override ENV). ENV default: TEST_TO_DOC, TEST_TO_EMAIL, TEST_TO_TOKEN.
+  const getArg = (k) => {
+    const a = process.argv.find((x) => x.startsWith(`${k}=`));
+    return a ? a.split("=").slice(1).join("=") : null;
+  };
+  const opts = {
+    toDoc: getArg("--to-doc"),
+    toEmail: getArg("--to-email"),
+    toToken: getArg("--to-token"),
+  };
+  sendTestStaggered(n, opts).then(() => process.exit(0));
 } else if (process.argv.includes("--test")) {
   sendTest().then(() => process.exit(0));
 } else {

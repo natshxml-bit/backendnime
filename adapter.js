@@ -974,11 +974,92 @@ function listOf(type, page, items, total) {
 }
 
 async function ongoing(page = 1) {
-  return statusList("ongoing", page);
+  // Primary: otakudesu (data lebih segar & lengkap, ~25/page). Kalau gagal
+  // (offline / domain expired), fallback ke animekita STATUS (crawler cache).
+  // Slug format kompatibel (`xxx-sub-indo`) sehingga detail/episode di
+  // animekita /anime/:slug biasanya resolve.
+  const ot = await ongoingFromOtakudesu(page);
+  if (Array.isArray(ot?.animeList) && ot.animeList.length > 0) return ot;
+  const an = await statusList("ongoing", page);
+  if (Array.isArray(an?.animeList) && an.animeList.length > 0) return an;
+  return ot; // both failed
 }
 
 async function complete(page = 1) {
   return statusList("completed", page);
+}
+
+// FALLBACK: scrape ongoing list dari otakudesu.best (hostingan .blog expired).
+// Dipakai kalau animekita ongoing kosong. Slug diambil dari path
+// /anime/<slug>/; poster dari <img src>. Episode/day dari class detpost
+// (Episode N + day name). Format response sama dengan listOf() supaya
+// caller (/list/ongoing, /ongoing-anime) tidak perlu ubah.
+async function ongoingFromOtakudesu(page = 1) {
+  const base = process.env.OTAKUDESU_BASE || "https://otakudesu.best";
+  const url = page > 1 ? `${base}/ongoing-anime/page/${page}/` : `${base}/ongoing-anime/`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) {
+      console.warn(`[otakudesu] ongoing page ${page} HTTP ${res.status}`);
+      return { type: "ongoing", page, animeList: [], has_next: false, next_page: null };
+    }
+    const html = await res.text();
+    // Setiap <li> di dalam <div class="venz"> = 1 anime.
+    // Struktur: <img src=...> MUNCUL DULU, baru <h2 class="jdlflm">TITLE</h2>.
+    // Regex tangkap: Episode N, day, date, slug, title, poster (dari <img>).
+    const re = /<li>\s*<div class='detpost'>\s*<div class='epz'>\s*<span[^>]*><\/span>\s*Episode\s*(\d+)<\/div>\s*<div class='epztipe'>\s*<i[^>]*><\/i>\s*([^<]+)<\/div>(?:\s*<div class="newnime">([^<]+)<\/div>)?\s*<div class="thumb">\s*<a\s+href="https?:\/\/otakudesu\.blog\/anime\/([^"\/]+)\/?"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*(?:\s+alt="([^"]*)")?[\s\S]*?<h2 class="jdlflm">\s*([^<]+?)\s*<\/h2>/gi;
+    const items = [];
+    let m;
+    while ((m = re.exec(html))) {
+      const ep = parseInt(m[1], 10) || null;
+      const day = String(m[2] || "").trim();
+      const dateLabel = String(m[3] || "").trim();
+      const slug = m[4];
+      const poster = m[5] || "";
+      const alt = m[6] || "";
+      const title = String(m[7] || "").trim();
+      if (!slug || !title) continue;
+      items.push({
+        animeId: slug,
+        title,
+        poster,
+        score: null,
+        status: "Ongoing",
+        type: "TV",
+        episode: ep,
+        quality: null,
+        genres: [],
+        day: day.toLowerCase(),
+        updatedLabel: dateLabel,
+        _alt: alt,
+      });
+    }
+    if (items.length === 0) {
+      console.warn(`[otakudesu] ongoing page ${page}: 0 item di-parse`);
+    }
+    // Deteksi next page: cari <a ... href=".../page/2/" >Next</a> atau page/N+1
+    const pageNums = [...html.matchAll(/\/ongoing-anime\/page\/(\d+)\/?/g)].map((x) => parseInt(x[1], 10)).filter((n) => Number.isFinite(n));
+    const maxPage = pageNums.length ? Math.max(...pageNums, page) : page;
+    const hasNext = maxPage > page;
+    return {
+      type: "ongoing",
+      page,
+      animeList: items,
+      has_next: hasNext,
+      next_page: hasNext ? page + 1 : null,
+    };
+  } catch (e) {
+    console.warn(`[otakudesu] ongoing page ${page} gagal: ${e.message}`);
+    return { type: "ongoing", page, animeList: [], has_next: false, next_page: null };
+  }
 }
 
 async function listByType(type, page = 1) {
@@ -1150,7 +1231,13 @@ async function episode(slug) {
   // JANGan verifikasi dari server — headCheck memakai IP datacenter (Railway)
   // dan ditolak upstream. URL mentah dikembalikan; device user yang memutar
   // (IP user). Lihat BACKEND_STREAMING_FIX.md.
-  const direct = qualities.length ? qualities[0].serverList[0].url : null;
+  // Strip "?download" dari URL pixeldrain — query tsb redirect ke HTML
+  // download page (gak playable di <video>). URL direct tanpa query
+  // return video/mp4 binary.
+  let direct = qualities.length ? qualities[0].serverList[0].url : null;
+  if (direct && /^https?:\/\/pixeldrain\.com\//.test(direct) && direct.includes("?")) {
+    direct = direct.split("?")[0];
+  }
   return {
     episodeId: epUrl,
     title: `Episode ${epUrl}`,
@@ -1158,10 +1245,16 @@ async function episode(slug) {
     defaultStreamingUrl: direct,
     streamUrl: direct,
     server: null,
-    servers: qualities.map((q) => ({
-      server: q.title,
-      qualities: q.serverList.map((sv) => ({ quality: sv.quality, url: sv.url })),
-    })),
+    servers: qualities.map((q) => {
+      const serverList = q.serverList.map((sv) => {
+        let url = sv.url;
+        if (/^https?:\/\/pixeldrain\.com\//.test(url) && url.includes("?")) {
+          url = url.split("?")[0];
+        }
+        return { quality: sv.quality, url };
+      });
+      return { server: q.title, qualities: serverList };
+    }),
   };
 }
 
@@ -1225,6 +1318,7 @@ module.exports = {
   schedule,
   genres,
   ongoing,
+  ongoingFromOtakudesu,
   cardFromList,
   cardFromListAsync,
   complete,

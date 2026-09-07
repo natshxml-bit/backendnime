@@ -1,0 +1,7 @@
+name = "animekita-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+PROXY_TOKEN = "555ac63ca076dc8ed42fb3990ab0e4eb9f2d"
+
