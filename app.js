@@ -895,6 +895,7 @@ app.get("/config", async (_req, res) => {
 
 const { Readable } = require("stream");
 const moov = require("./moov");
+const proxyCache = require("./proxyCache");
 const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;
 
 app.get("/proxy", async (req, res) => {
@@ -956,12 +957,31 @@ app.get("/proxy", async (req, res) => {
   };
   if (req.headers.range) headers["Range"] = req.headers.range;
 
+  // Retry: pixeldrain kadang return 403 max_concurrent_downloads kalau Railway
+  // IP share dengan banyak user. Tunggu sebentar lalu retry.
   let upstream;
-  try {
-    upstream = await fetch(upstreamUrl.toString(), { headers });
-  } catch (e) {
-    return res.status(502).json({ error: String(e && e.message) });
+  let attempt = 0;
+  const maxAttempts = 4;
+  while (attempt < maxAttempts) {
+    try {
+      upstream = await fetch(upstreamUrl.toString(), { headers });
+      if (upstream.ok || upstream.status === 206) break;
+      if (upstream.status === 403 || upstream.status === 429) {
+        const wait = 800 * Math.pow(2, attempt);
+        console.warn(`[proxy] ${raw} got ${upstream.status}, retry in ${wait}ms (attempt ${attempt + 1})`);
+        await new Promise((r) => setTimeout(r, wait));
+        attempt++;
+        continue;
+      }
+      break;
+    } catch (e) {
+      if (attempt === maxAttempts - 1) {
+        return res.status(502).json({ error: String(e && e.message) });
+      }
+      attempt++;
+    }
   }
+  if (!upstream) return res.status(502).json({ error: "upstream unavailable" });
 
   res.status(upstream.status);
   res.set({
