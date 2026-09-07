@@ -865,6 +865,22 @@ app.get("/admin/cache-bust-ep", requireAdmin, async (_req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// Simple admin token (env ADMIN_TOKEN) untuk invalidate cache tanpa Firebase.
+app.post("/admin/cache-bust", async (req, res) => {
+  const want = process.env.ADMIN_TOKEN || process.env.APP_API_KEY;
+  if (!want) return res.status(503).json({ error: "ADMIN_TOKEN/APP_API_KEY belum diset" });
+  const got = (req.headers.authorization || "").replace(/^Bearer /, "");
+  if (got !== want) return res.status(401).json({ error: "token salah" });
+  try {
+    const prefix = String(req.body?.prefix || "ep:");
+    const keys = await db.keysLike(`${prefix}%`);
+    for (const k of keys) await db.del(k);
+    res.json({ cleared: keys.length, prefix });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get("/config", async (_req, res) => {
   try {
     res.json({
