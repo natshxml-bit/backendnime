@@ -692,7 +692,7 @@ async function getSeries(slug) {
 }
 
 async function getEpisodeData(epUrl) {
-  return cached(`epdata:${epUrl}`, 30 * 60 * 1000, async () => {
+  return cached(`epdata:${epUrl}`, 5 * 60 * 1000, async () => {
     let data = null;
     try {
       data = await apiGet("series/episode/data.php", { url: epUrl });
