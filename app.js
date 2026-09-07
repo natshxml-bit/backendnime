@@ -77,7 +77,7 @@ const RATE_MAX = 300;
 const rateBuckets = new Map();
 
 function rateLimit(req, res, next) {
-  if (req.path === "/proxy") return next();
+  if (req.path === "/proxy" || req.path.startsWith("/hls-seg/") || req.path === "/hls") return next();
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   const now = Date.now();
   const bucket = rateBuckets.get(ip) || [];
@@ -114,8 +114,10 @@ app.use((req, res, next) => {
 // yang sudah punya token sendiri) wajib header `X-Api-Key` == APP_API_KEY.
 // APP_API_KEY dikonfigurasi via env Railway; di-rotate → clone mati.
 const KEYLESS_PATHS = new Set(["/", "/relay"]);
+const KEYLESS_PREFIXES = ["/hls-seg/"];
 function requireAppKey(req, res, next) {
   if (KEYLESS_PATHS.has(req.path)) return next();
+  if (KEYLESS_PREFIXES.some((p) => req.path.startsWith(p))) return next();
   const expected = process.env.APP_API_KEY;
   if (!expected) {
     return res.status(503).json({ error: "APP_API_KEY belum dikonfigurasi di server" });
