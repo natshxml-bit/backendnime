@@ -1246,14 +1246,19 @@ async function episode(slug) {
     streamUrl: direct,
     server: null,
     servers: qualities.map((q) => {
-      const serverList = q.serverList.map((sv) => {
+      const serverList = q.serverList.map((sv, i) => {
         let url = sv.url;
         if (/^https?:\/\/pixeldrain\.com\//.test(url) && url.includes("?")) {
           url = url.split("?")[0];
         }
-        return { quality: sv.quality, url };
+        return {
+          quality: sv.quality || q.title,
+          title: `${q.title} · Mirror ${i + 1}`,
+          url,
+          size: sv.size,
+        };
       });
-      return { server: q.title, qualities: serverList };
+      return { quality: q.title, server: q.title, serverList, qualities: serverList };
     }),
   };
 }
