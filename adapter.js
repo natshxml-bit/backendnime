@@ -293,13 +293,28 @@ function apiUrl(base, path, params) {
   return url.toString();
 }
 
+const workersPool = process.env.WORKER_URLS ? require("./workers") : null;
+
 async function apiGet(path, params = {}) {
-  // Sumber fetch:
-  // 1) ANIMEKITA_PROXY_URL (Cloudflare Worker, IP CF) — jalur utama, dipakai sync di Railway.
-  // 2) Direct ke apps.animekita.org — cadangan kalau worker error.
-  // (Relay Termux/cloudflared sudah dipensiunkan — lihat git history cutover.)
+  // Sumber fetch (urutan prioritas):
+  // 1) WORKER_URLS multi-account pool (animekita-proxy-1, -2, -3 di akun
+  //    Cloudflare berbeda) — round-robin + auto-block on 403. AnimeLovers
+  //    V3 & NanimeID Merdeka pakai pola multi-zone untuk hindari CF IP block.
+  // 2) ANIMEKITA_PROXY_URL (single Worker, legacy) — backward compat.
+  // 3) Direct ke apps.animekita.org — terakhir kalau semua Worker kena 403.
   const headers = { "User-Agent": UA, Accept: "application/json" };
 
+  // Strategy 1: multi-account Worker pool
+  if (workersPool) {
+    try {
+      const data = await workersPool.scrape(path, params);
+      return data;
+    } catch (e) {
+      console.warn(`[apiGet] workers pool failed, fallback: ${e.message}`);
+    }
+  }
+
+  // Strategy 2: single Worker (legacy)
   if (process.env.ANIMEKITA_PROXY_URL) {
     try {
       if (process.env.ANIMEKITA_PROXY_TOKEN) {
@@ -313,12 +328,13 @@ async function apiGet(path, params = {}) {
       }
       const res = await fetch(url.toString(), { headers });
       if (res.ok) return parseApiBody(await res.text(), path);
-      console.warn(`[apiGet] proxy worker ${res.status}, fallback direct: ${path}`);
+      console.warn(`[apiGet] legacy worker ${res.status}, fallback direct: ${path}`);
     } catch (e) {
-      console.warn(`[apiGet] proxy worker error, fallback direct: ${e.message}`);
+      console.warn(`[apiGet] legacy worker error, fallback direct: ${e.message}`);
     }
   }
 
+  // Strategy 3: direct animekita (Railway IP, biasanya kena 403)
   const res = await fetch(apiUrl(API_BASE, path, params), { headers });
   if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
   return parseApiBody(await res.text(), path);
