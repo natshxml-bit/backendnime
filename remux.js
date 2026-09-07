@@ -10,6 +10,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const pixeldrain = require("./pixeldrain");
 
 const CACHE_DIR = process.env.REMUX_CACHE_DIR || "/app/data/remux";
 const TTL_MS = 6 * 60 * 60 * 1000;
@@ -39,47 +40,50 @@ function isCached(url) {
 
 const inflight = new Map();
 
+// Download MP4 ke local via pixeldrain queue, lalu ffmpeg remux.
 function remux(url) {
-  if (isCached(url)) {
-    return Promise.resolve(cachePath(url));
-  }
+  if (isCached(url)) return Promise.resolve(cachePath(url));
   if (inflight.has(url)) return inflight.get(url);
 
   const dst = cachePath(url);
   const tmp = dst + ".remuxing";
-  const promise = new Promise((resolve, reject) => {
-    const args = [
-      "-y",
-      "-i", url,
-      "-c", "copy",
-      "-movflags", "+faststart",
-      "-f", "mp4",
-      tmp,
-    ];
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (e) => {
-      inflight.delete(url);
-      reject(new Error("ffmpeg spawn: " + e.message));
+  const sourceMp4 = dst + ".source";
+
+  const promise = (async () => {
+    // Download source via queue
+    if (!fs.existsSync(sourceMp4) || fs.statSync(sourceMp4).size < 1024) {
+      const res = await pixeldrain.fetch(url);
+      if (!res.ok) throw new Error(`pixeldrain HTTP ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(sourceMp4, buf);
+    }
+
+    // Remux local file
+    await new Promise((resolve, reject) => {
+      const args = [
+        "-y", "-i", sourceMp4,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        tmp,
+      ];
+      const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      proc.stderr.on("data", (d) => { stderr += d.toString(); });
+      proc.on("error", reject);
+      proc.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error("ffmpeg exit " + code + ": " + stderr.slice(-500)));
+      });
     });
-    proc.on("close", (code) => {
-      if (code === 0) {
-        try {
-          fs.renameSync(tmp, dst);
-          inflight.delete(url);
-          resolve(dst);
-        } catch (e) {
-          inflight.delete(url);
-          reject(e);
-        }
-      } else {
-        try { fs.unlinkSync(tmp); } catch {}
-        inflight.delete(url);
-        reject(new Error("ffmpeg exit " + code + ": " + stderr.slice(-500)));
-      }
-    });
+
+    fs.renameSync(tmp, dst);
+    try { fs.unlinkSync(sourceMp4); } catch {}
+    return dst;
+  })().finally(() => {
+    inflight.delete(url);
   });
+
   inflight.set(url, promise);
   return promise;
 }

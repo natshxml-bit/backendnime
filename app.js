@@ -154,6 +154,19 @@ app.get("/", (_req, res) => {
   res.status(204).end();
 });
 
+// Pixeldrain queue stats (debug/monitor)
+app.get("/queue-stats", (req, res) => {
+  const key = req.get("x-api-key") || req.query.apikey;
+  if (key !== process.env.APP_API_KEY) {
+    return res.status(401).json({ error: "api key salah" });
+  }
+  res.json({
+    pixeldrain: pixeldrain.stats(),
+    inflightHls: hlsMod.inflightCount ? hlsMod.inflightCount() : "n/a",
+    ts: Date.now(),
+  });
+});
+
 // status watcher: baca heartbeat yang ditulis watcher tiap tick
 app.get("/watcher-status", async (_req, res) => {
   try {
@@ -900,6 +913,7 @@ const moov = require("./moov");
 const proxyCache = require("./proxyCache");
 const remuxMod = require("./remux");
 const hlsMod = require("./hls");
+const pixeldrain = require("./pixeldrain");
 const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;
 
 // HLS streaming — convert MP4 ke HLS playlist (segments .ts) pakai ffmpeg,
@@ -1066,31 +1080,19 @@ app.get("/proxy", async (req, res) => {
   };
   if (req.headers.range) headers["Range"] = req.headers.range;
 
-  // Retry: pixeldrain kadang return 403 max_concurrent_downloads kalau Railway
-  // IP share dengan banyak user. Tunggu sebentar lalu retry.
+  // Pakai pixeldrain queue (single-flight + smart retry) supaya gak kena
+  // max_concurrent_downloads limit. AnimeLovers-style: queue serial fetch.
   let upstream;
-  let attempt = 0;
-  const maxAttempts = 4;
-  while (attempt < maxAttempts) {
-    try {
-      upstream = await fetch(upstreamUrl.toString(), { headers });
-      if (upstream.ok || upstream.status === 206) break;
-      if (upstream.status === 403 || upstream.status === 429) {
-        const wait = 800 * Math.pow(2, attempt);
-        console.warn(`[proxy] ${raw} got ${upstream.status}, retry in ${wait}ms (attempt ${attempt + 1})`);
-        await new Promise((r) => setTimeout(r, wait));
-        attempt++;
-        continue;
-      }
-      break;
-    } catch (e) {
-      if (attempt === maxAttempts - 1) {
-        return res.status(502).json({ error: String(e && e.message) });
-      }
-      attempt++;
+  try {
+    const pixReq = /^https?:\/\/pixeldrain\.com\//i.test(upstreamUrl.toString());
+    if (pixReq) {
+      upstream = await pixeldrain.fetch(upstreamUrl.toString(), { range: req.headers.range });
+    } else {
+      upstream = await fetch(upstreamUrl.toString(), { headers: { ...headers, Range: req.headers.range } });
     }
+  } catch (e) {
+    return res.status(502).json({ error: "upstream fetch failed: " + e.message });
   }
-  if (!upstream) return res.status(502).json({ error: "upstream unavailable" });
 
   res.status(upstream.status);
   res.set({

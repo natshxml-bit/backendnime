@@ -14,6 +14,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const pixeldrain = require("./pixeldrain");
 
 const CACHE_DIR = process.env.HLS_CACHE_DIR || "/app/data/hls";
 const SEGMENT_TIME = 6; // detik per segment
@@ -35,54 +36,71 @@ function isReady(url) {
   try {
     const stat = fs.statSync(playlist);
     if (Date.now() - stat.mtimeMs > TTL_MS) return false;
-    // Cek minimal 1 segment
     return fs.readdirSync(d).some((f) => f.endsWith(".ts"));
   } catch { return false; }
 }
 
 const inflight = new Map();
 
+// Step 1: download MP4 ke local file via pixeldrain queue (single-flight)
+// Step 2: ffmpeg convert local file → HLS segments
 function generate(url) {
   if (isReady(url)) return Promise.resolve(dir(url));
   if (inflight.has(url)) return inflight.get(url);
 
-  const d = dir(url);
-  fs.mkdirSync(d, { recursive: true });
-  const playlist = path.join(d, "index.m3u8");
-  const segmentPath = path.join(d, "seg_%03d.ts");
+  const promise = (async () => {
+    const d = dir(url);
+    fs.mkdirSync(d, { recursive: true });
+    const localMp4 = path.join(d, "_source.mp4");
+    const playlist = path.join(d, "index.m3u8");
+    const segmentPath = path.join(d, "seg_%03d.ts");
 
-  const promise = new Promise((resolve, reject) => {
-    const args = [
-      "-y",
-      "-i", url,
-      "-c", "copy",
-      "-f", "hls",
-      "-hls_time", String(SEGMENT_TIME),
-      "-hls_list_size", "0",
-      "-hls_segment_filename", segmentPath,
-      "-hls_flags", "independent_segments",
-      playlist,
-    ];
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    proc.on("error", (e) => {
-      inflight.delete(url);
-      reject(new Error("ffmpeg spawn: " + e.message));
-    });
-    proc.on("close", (code) => {
-      if (code === 0) {
-        inflight.delete(url);
-        resolve(d);
-      } else {
-        inflight.delete(url);
-        try { fs.rmSync(d, { recursive: true, force: true }); } catch {}
-        reject(new Error("ffmpeg exit " + code + ": " + stderr.slice(-300)));
+    // Download MP4 dulu (via queue — single concurrent ke pixeldrain)
+    if (!fs.existsSync(localMp4) || fs.statSync(localMp4).size < 1024) {
+      const res = await pixeldrain.fetch(url);
+      if (!res.ok) {
+        throw new Error(`pixeldrain HTTP ${res.status}`);
       }
+      const buf = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(localMp4, buf);
+      // Clear partial segments kalau ada
+      try {
+        for (const f of fs.readdirSync(d)) {
+          if (f.endsWith(".ts") || f === "index.m3u8") fs.unlinkSync(path.join(d, f));
+        }
+      } catch {}
+    }
+
+    // Convert local MP4 → HLS pakai ffmpeg (no upstream network)
+    await new Promise((resolve, reject) => {
+      const args = [
+        "-y",
+        "-i", localMp4,
+        "-c", "copy",
+        "-f", "hls",
+        "-hls_time", String(SEGMENT_TIME),
+        "-hls_list_size", "0",
+        "-hls_segment_filename", segmentPath,
+        "-hls_flags", "independent_segments",
+        playlist,
+      ];
+      const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      proc.on("error", reject);
+      proc.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error("ffmpeg exit " + code + ": " + stderr.slice(-300)));
+      });
     });
+
+    return d;
+  })().finally(() => {
+    inflight.delete(url);
   });
+
   inflight.set(url, promise);
   return promise;
 }
 
-module.exports = { generate, isReady, dir, CACHE_DIR };
+module.exports = { generate, isReady, dir, CACHE_DIR, stats: pixeldrain.stats };
