@@ -1251,10 +1251,18 @@ async function episode(slug) {
         if (/^https?:\/\/pixeldrain\.com\//.test(url) && url.includes("?")) {
           url = url.split("?")[0];
         }
+        // AnimeLovers-style: backend sediakan HLS playlist untuk pixeldrain
+        // (ffmpeg segment, served dari disk). Player pilih ExoPlayer/HLS.js.
+        // directUrl tetap direct MP4 untuk user yang tidak support HLS.
+        const isPix = /^https?:\/\/pixeldrain\.com\//i.test(url);
+        const hlsUrl = isPix
+          ? `${process.env.PUBLIC_BASE || ""}/hls?url=${encodeURIComponent(url)}`
+          : null;
         return {
           quality: sv.quality || q.title,
           title: `${q.title} · Mirror ${i + 1}`,
           url,
+          hlsUrl,
           size: sv.size,
         };
       });

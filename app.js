@@ -897,7 +897,59 @@ const { Readable } = require("stream");
 const moov = require("./moov");
 const proxyCache = require("./proxyCache");
 const remuxMod = require("./remux");
+const hlsMod = require("./hls");
 const PROXY_ALLOWED = /(^|\.)(animekita\.org|r2\.cloudflarestorage\.com|kotakanimeid\.link|pixeldrain\.com)$/i;
+
+// HLS streaming — convert MP4 ke HLS playlist (segments .ts) pakai ffmpeg,
+// serve playlist + segments dari Railway volume. AnimeLovers-style: ExoPlayer
+// + HLS support multiple variants, ABR (adaptive bitrate) otomatis.
+// URL: /hls?url=<mp4-url>  → /hls/<hash>/<filename>
+app.get("/hls", async (req, res) => {
+  const raw = req.query.url;
+  if (!raw || !/^https?:\/\//i.test(String(raw))) {
+    return res.status(400).json({ error: "url tidak valid" });
+  }
+  let upstreamUrl;
+  try { upstreamUrl = new URL(String(raw)); } catch {
+    return res.status(400).json({ error: "url tidak valid" });
+  }
+  if (!PROXY_ALLOWED.test(upstreamUrl.hostname)) {
+    return res.status(403).json({ error: "domain tidak diizinkan" });
+  }
+  try {
+    const d = await hlsMod.generate(String(raw));
+    res.set({
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=60",
+    });
+    return res.sendFile(path.join(d, "index.m3u8"));
+  } catch (e) {
+    console.warn(`[hls] gagal: ${e.message}`);
+    return res.status(502).json({ error: "hls generation gagal: " + e.message });
+  }
+});
+
+// Serve HLS segments (.ts) dari cache dir
+app.get("/hls-seg/:hash/:filename", async (req, res) => {
+  const { hash, filename } = req.params;
+  if (!/^[a-f0-9]{16}$/.test(hash) || !/^seg_\d{3}\.ts$/.test(filename)) {
+    return res.status(400).end();
+  }
+  const p = path.join(hlsMod.CACHE_DIR, hash, filename);
+  try {
+    const stat = fs.statSync(p);
+    res.set({
+      "Content-Type": "video/mp2t",
+      "Content-Length": String(stat.size),
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+    });
+    return fs.createReadStream(p).pipe(res);
+  } catch {
+    return res.status(404).end();
+  }
+});
 
 app.get("/proxy", async (req, res) => {
   const raw = req.query.url;
