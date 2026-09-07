@@ -827,6 +827,11 @@ app.get("/list/:type", wrap((req) => {
 app.get("/episode/*splat", wrap((req) => {
   const s = req.params.splat;
   const epPath = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
+  if (req.query.fresh || req.query.nocache) {
+    const data = await adapter.episode(epPath);
+    db.set(`ep:${epPath}`, data).catch(() => {});
+    return data;
+  }
   return dbFirst(`ep:${epPath}`, () => adapter.episode(epPath), 12 * 60 * 60 * 1000);
 }));
 
