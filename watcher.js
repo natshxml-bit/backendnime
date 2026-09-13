@@ -36,6 +36,7 @@ const STAGGER_MS = parseInt(process.env.WATCH_STAGGER_MS || "90", 10) * 1000;
 // Cegah double-fire kalau Railway restart di tengah window.
 const NOTIFIED_TTL_MS = 7 * 24 * 3600 * 1000;
 // collapse_key seragam agar FCM/Android/iOS merge notif yg di-retry
+// (legacy) dulu dipakai semua-anime-sama → bikin notif tabrakan. Sekarang collapse_key unik per anime+ep di notifyEpisode().
 const COLLAPSE_KEY = process.env.WATCH_COLLAPSE_KEY || "weekly_digest";
 
 function loadCredential() {
@@ -447,11 +448,15 @@ async function notifyEpisode(anime, ep, users, tokens) {
         },
         android: {
           priority: "high",
-          collapse_key: COLLAPSE_KEY,
+          // collapse_key UNIK per anime+episode. Kalau pakai key yang sama
+          // buat semua anime (mis. "weekly_digest"), Android bisa nampilin
+          // notif anime B beda barengan dgn anime A sebelum yang lama
+          // ke-collapse → kelihatan "2 notif muncul sekaligus".
+          collapse_key: `ep-${String(animeId).slice(0, 40)}-${ep}`,
           notification: { channelId: "episode_rilis" },
         },
-        apns: { headers: { "apns-collapse-id": COLLAPSE_KEY } },
-        webpush: { headers: { Topic: COLLAPSE_KEY } },
+        apns: { headers: { "apns-collapse-id": `ep-${String(animeId).slice(0, 40)}-${ep}` } },
+        webpush: { headers: { Topic: `ep-${String(animeId).slice(0, 40)}-${ep}` } },
         data: { animeId: String(animeId), url: link, poster: poster || "", type: "SINGLE" },
       });
       const invalid = new Set();
