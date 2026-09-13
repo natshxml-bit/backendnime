@@ -236,6 +236,8 @@ function wibDayName() {
 }
 
 // map animeId -> { day, title, poster, updated } dari /schedule.
+// HANYA hari ini (elemen pertama response; API mengurutkan mulai hari
+// berjalan) — biar tiap tick cuma cek ±10 anime, bukan semua 58.
 // return null kalau gagal (biar watcher fallback ke perilaku lama).
 async function getScheduleMap() {
   try {
@@ -243,8 +245,10 @@ async function getScheduleMap() {
     if (!res.ok) throw new Error(`schedule ${res.status}`);
     const days = await res.json();
     if (!Array.isArray(days)) throw new Error("schedule bukan array");
+    const todayOnly = Array.isArray(days) && days.length > 0 ? [days[0]] : days;
+    console.log(`[watcher] jadwal hari ini: ${days.length > 0 ? days[0].day : "?"} (${(days.length > 0 ? days[0].anime_list || [] : []).length} anime)`);
     const map = {};
-    for (const day of days) {
+    for (const day of todayOnly) {
       for (const a of Array.isArray(day.anime_list) ? day.anime_list : []) {
         if (a && a.animeId) {
           map[a.animeId] = {
@@ -496,6 +500,10 @@ function scheduleStaggered(items, users, tokens) {
     const it = items[i];
     const delay = i * STAGGER_MS;
     setTimeout(async () => {
+      // Set cooldown in-memory TEPAT sebelum kirim — bukan saat masuk antrian.
+      // Kalau di-set di awal antrian, tick berikutnya (15 mnt) bisa nyusul
+      // sebelum antrian kelar → episode sama kekirim 2x.
+      lastNotified[it.animeId] = Date.now();
       console.log(`[watcher] FCM stagger kirim #${i + 1}/${items.length} (delay ${delay / 1000}s): ${cleanTitle(it.title)} EP ${it.ep}`);
       try {
         await notifyEpisode({ animeId: it.animeId, title: it.title, poster: it.poster }, it.ep, users, tokens);
@@ -506,6 +514,29 @@ function scheduleStaggered(items, users, tokens) {
 }
 
 let ticking = false;
+// Batas notif harian (semua anime digabung). Lampaui → skip notif, cukup
+// baseline + mark Firestore biar gak nyusul pas besok (anti backlog).
+const DAILY_NOTIF_CAP = parseInt(process.env.WATCH_DAILY_CAP || "12", 10);
+// QUIET mode: catch-up snapshot TANPA kirim FCM (buat abis backfill/restart
+// besar). Set env WATCH_QUIET=1, jalankan 1-2 tick, lalu hapus env.
+const QUIET = process.env.WATCH_QUIET === "1";
+let notifCount = 0;
+let notifDate = new Date().toISOString().slice(0, 10);
+try {
+  const s = JSON.parse(fs.readFileSync(path.join(__dirname, "data", "notif_daily.json"), "utf8"));
+  if (s.date === notifDate) notifCount = s.count || 0;
+} catch {}
+function bumpNotifCount(n = 1) {
+  notifCount += n;
+  try {
+    fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
+    fs.writeFileSync(path.join(__dirname, "data", "notif_daily.json"), JSON.stringify({ date: notifDate, count: notifCount }));
+  } catch {}
+}
+function checkDateRollover() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== notifDate) { notifDate = today; notifCount = 0; bumpNotifCount(0); }
+}
 async function tick() {
   if (ticking) return; // cegah tick bertumpuk (tick lama belum selesai)
   ticking = true;
@@ -533,10 +564,28 @@ async function tick() {
       // suka notif terpisah, asal tidak dikirim bareng. Filter pakai cooldown
       // in-memory (10 mnt) + cooldown persistent Firestore (anti re-fire
       // setelah restart).
+      // QUIET mode / cap harian → item dilewati notif tapi tetap baseline
+      // + mark Firestore (supaya gak muncul lagi, dan gak numpuk jadi backlog).
+      checkDateRollover();
+      const remainingToday = Math.max(DAILY_NOTIF_CAP - notifCount, 0);
+      const quiet = QUIET || remainingToday <= 0;
+      if (quiet) {
+        console.log(
+          QUIET
+            ? `[watcher] QUIET mode: ${newEpisodes.length} rilis di-baseline tanpa notif`
+            : `[watcher] cap harian tercapai (${notifCount}/${DAILY_NOTIF_CAP}): ${newEpisodes.length} rilis di-baseline tanpa notif`
+        );
+      }
       const staggerItems = [];
       const deferred = [];
       for (const c of newEpisodes) {
         const animeId = c.anime.animeId || c.anime.id;
+        if (quiet) {
+          // QUIET / cap harian: baseline + mark Firestore, TANPA kirim FCM
+          maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
+          await markEpisodeNotified(animeId, c.ep).catch(() => {});
+          continue;
+        }
         if (staggerItems.length >= MAX_NOTIF_PER_TICK) {
           // cap total tick (anti lonjakan besar) — sisanya di-defer
           deferred.push(c);
@@ -553,7 +602,9 @@ async function tick() {
           maxByAnime[animeId] = { u: c.u || 0, e: c.ep };
           continue;
         }
-        lastNotified[animeId] = now;
+        // JANGAN set lastNotified di sini — biar tick berikutnya (kalau antrian
+        // belum kelar) tetap kenal item ini via isEpisodeNotified/antrian.
+        // Cooldown di-set tepat saat FCM dikirim (lihat scheduleStaggered).
         staggerItems.push({
           animeId,
           ep: c.ep,
@@ -567,10 +618,23 @@ async function tick() {
         for (const it of staggerItems) {
           console.log(`[watcher] Episode baru: ${cleanTitle(it.title)} EP ${it.ep}`);
         }
-        // schedule staggered (tidak await — fire-and-forget biar tick cepat selesai)
-        scheduleStaggered(staggerItems, users, tokens);
-        // catat di Firestore supaya restart berikutnya skip
-        await Promise.allSettled(staggerItems.map((it) => markEpisodeNotified(it.animeId, it.ep)));
+        if (quiet) {
+          // double-check: kalau QUIET aktif setelah loop, jangan kirim
+          for (const it of staggerItems) {
+            await markEpisodeNotified(it.animeId, it.ep).catch(() => {});
+          }
+          console.log(`[watcher] QUIET: ${staggerItems.length} rilis di-baseline tanpa notif`);
+        } else {
+          // PENTING (anti double-notif): catat ke Firestore DULU (await),
+          // baru kirim FCM. Kalau urutannya kebalik dan proses restart / tick
+          // berikutnya jalan sebelum log kestore, episode yang sama bisa
+          // terkirim 2x (persis bug double notif).
+          await Promise.allSettled(staggerItems.map((it) => markEpisodeNotified(it.animeId, it.ep)));
+          // baru kirim — staggered, fire-and-forget biar tick cepat selesai
+          scheduleStaggered(staggerItems, users, tokens);
+          bumpNotifCount(staggerItems.length);
+          console.log(`[watcher] notif hari ini: ${notifCount}/${DAILY_NOTIF_CAP}`);
+        }
       } else {
         console.log(`[watcher] tidak ada rilis baru yg perlu di-notify (${newEpisodes.length} kandidat, semua di-cooldown)`);
       }
