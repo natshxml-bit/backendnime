@@ -143,11 +143,12 @@ function verifyMedia(scope, token) {
   } catch { return false; }
 }
 // scope media: token valid buat /proxy, /hls, /hls-seg (semua jalur media)
-app.get("/media-token", (req, res) => {
+app.get("/media-token", async (req, res) => {
   // Boleh: tiket Firebase valid (req.uid diset gate) ATAU app key lama — dua2nya
   // jalur sah; media token-nya tetap HMAC + expire.
   const key = req.get("x-api-key") || req.query.apikey;
   const keyOk = !!process.env.APP_API_KEY && key === process.env.APP_API_KEY;
+  if (!keyOk && !req.uid) req.uid = await verifyBearer(req); // route ini terdaftar sebelum gate — verifikasi sendiri
   if (!keyOk && !req.uid) {
     return res.status(401).json({ error: "key atau token firebase wajib" });
   }
