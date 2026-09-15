@@ -144,11 +144,14 @@ function verifyMedia(scope, token) {
 }
 // scope media: token valid buat /proxy, /hls, /hls-seg (semua jalur media)
 app.get("/media-token", (req, res) => {
+  // Boleh: tiket Firebase valid (req.uid diset gate) ATAU app key lama — dua2nya
+  // jalur sah; media token-nya tetap HMAC + expire.
   const key = req.get("x-api-key") || req.query.apikey;
-  if (!process.env.APP_API_KEY || key !== process.env.APP_API_KEY) {
-    return res.status(401).json({ error: "api key salah" });
+  const keyOk = !!process.env.APP_API_KEY && key === process.env.APP_API_KEY;
+  if (!keyOk && !req.uid) {
+    return res.status(401).json({ error: "key atau token firebase wajib" });
   }
-  const { token, exp } = signMedia("media", 6 * 60 * 60 * 1000);
+  const { token, exp } = signMedia(req.uid && req.uid !== "internal" ? `media:${req.uid}` : "media", 6 * 60 * 60 * 1000);
   res.json({ token, exp, path: "/proxy?url=...&t=" + token });
 });
 const KEYLESS_PREFIXES = ["/hls-seg/"];
@@ -191,6 +194,8 @@ async function requireAppKey(req, res, next) {
     // (media tag gak bisa kirim header) — selain itu tetap wajib app key.
     if (req.path === "/proxy" || req.path === "/hls" || req.path.startsWith("/hls-seg/")) {
       if (verifyMedia("media", req.query.t)) return next();
+      // uid-scoped token (yang di-mint dengan Bearer) juga sah untuk media
+      if (req.uid && req.uid !== "internal" && verifyMedia(`media:${req.uid}`, req.query.t)) return next();
     }
     if (req.path === "/img") return next(); // proxy poster utk icon FCM — Google bot yang fetch, gak punya Bearer
     const expected = process.env.APP_API_KEY;
