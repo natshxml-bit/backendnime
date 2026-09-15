@@ -295,6 +295,10 @@ function apiUrl(base, path, params) {
 
 const workersPool = process.env.WORKER_URLS ? require("./workers") : null;
 
+// Cursor round-robin untuk Strategy 3 (relay Railway): tiap request mulai
+// dari relay berikutnya, beban IP terbagi rata.
+let relayCursor = 0;
+
 async function apiGet(path, params = {}) {
   // Sumber fetch (urutan prioritas):
   // 1) WORKER_URLS multi-account pool (animekita-proxy-1, -2, -3 di akun
@@ -334,16 +338,63 @@ async function apiGet(path, params = {}) {
     }
   }
 
-  // Strategy 3: direct animekita (Railway IP, biasanya kena 403)
+  // Strategy 3: relay via Railway instances — ROUND-ROBIN. Tiap request
+  // mulai dari relay BERIKUTNYA (cursor geser), jadi beban IP terbagi rata
+  // antar relay dan tidak ada satu IP yang di-hit terus sampai kena 403.
+  // Kalau relay yang ditunjuk gagal (403/error), lanjut ke relay berikutnya
+  // secara melingkar sampai ketemu yang sehat.
+  const relayUrls = [
+    ...(process.env.RAILWAY_RELAY_URLS || "").split(",").map(s => s.trim()).filter(Boolean),
+    ...(process.env.RAILWAY_RELAY_URL ? [process.env.RAILWAY_RELAY_URL] : []),
+  ];
+  const relayToken = process.env.RELAY_TOKEN || "tsukinime123";
+  let relayLastErr = null;
+  const n = relayUrls.length;
+  const ordered = n > 1
+    ? relayUrls.slice(relayCursor % n).concat(relayUrls.slice(0, relayCursor % n))
+    : relayUrls;
+  if (n > 0) relayCursor = (relayCursor + 1) % n;
+  for (const base of ordered) {
+    try {
+      const relay = new URL(base);
+      relay.pathname = "/relay";
+      relay.searchParams.set("path", path);
+      for (const [k, v] of Object.entries(params)) {
+        if (v != null && v !== "") relay.searchParams.set(k, String(v));
+      }
+      const rres = await fetch(relay.toString(), {
+        headers: { ...headers, "X-Relay-Token": relayToken },
+        signal: AbortSignal.timeout(25000),
+      });
+      if (rres.ok) return parseApiBody(await rres.text(), path);
+      relayLastErr = `${base} -> ${rres.status}`;
+      console.warn(`[apiGet] railway relay ${rres.status} (${base}), next relay: ${path}`);
+    } catch (e) {
+      relayLastErr = `${base} -> ${e.message}`;
+      console.warn(`[apiGet] railway relay error (${base}): ${e.message}`);
+    }
+  }
+  if (relayUrls.length > 0 && relayLastErr) {
+    console.warn(`[apiGet] all ${relayUrls.length} relay(s) failed, fallback direct: ${relayLastErr}`);
+  }
+
+  // Strategy 4: direct animekita (bimxyz IP) — TERAKHIR.
+  // NO_DIRECT=1 → MATIKAN: IP utama tidak boleh nyentuh animekita sama
+  // sekali. Kalau semua relay gagal, throw error (dbFirst di app.js akan
+  // serve data cache lama daripada maksa fetch dari IP utama).
+  if (process.env.NO_DIRECT === "1") {
+    throw new Error(`semua relay gagal & direct dimatikan (NO_DIRECT=1): ${path} | ${relayLastErr || "no relay"}`);
+  }
   const res = await fetch(apiUrl(API_BASE, path, params), { headers });
   if (!res.ok) throw new Error(`animekita api ${res.status}: ${path}`);
   return parseApiBody(await res.text(), path);
 }
 
 function normalizeSlug(slug) {
-  return String(slug || "")
-    .replace(/^\/+|\/+$/g, "")
-    .replace(/,/g, "/");
+  // JANGAN ubah koma jadi "/" — slug animekita asli mengandung koma
+  // (mis. "dakara-boku-wa,-h-ga-dekinai.") dan upstream menerimanya.
+  // Cukup buang slash di pinggir.
+  return String(slug || "").replace(/^\/+|\/+$/g, "");
 }
 
 function anilistIdFromUrl(url) {
@@ -790,8 +841,8 @@ async function home() {
     else queueBannerSearch(item.title, slug);
     return item;
   });
-  const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 10);
-  const completedList = (await statusList("completed", 1)).animeList.slice(0, 10);
+  const ongoingList = (await statusList("ongoing", 1)).animeList.slice(0, 21);
+  const completedList = (await statusList("completed", 1)).animeList.slice(0, 21);
   const movieList = await Promise.all((Array.isArray(movie) ? movie : []).map(cardFromListAsync));
 
   const allItems = [...(await Promise.all(recent)), ...ongoingList, ...completedList, ...movieList];
@@ -864,6 +915,8 @@ async function scheduleDayFor(slug) {
 }
 
 async function tryOtakudesuEpisodes(slug) {
+  // NO_DIRECT=1 → jangan sentuh otakudesu langsung dari IP utama.
+  if (process.env.NO_DIRECT === "1") return null;
   try {
     const html = await fetch(`https://otakudesu.lol/anime/${slug}/`, { headers: { "User-Agent": "Mozilla/5.0", Referer: "https://otakudesu.lol/" } }).then((r) => (r.ok ? r.text() : ""));
     if (!html) return null;
@@ -948,17 +1001,40 @@ async function schedule() {
     day: String(day.day || "").toLowerCase(),
     date: day.date || null,
     date_ts: day.date_ts || null,
-    anime_list: (Array.isArray(day.animeList) ? day.animeList : []).map((a) => ({
-      animeId: normalizeSlug(a.link) || a.id,
-      title: a.anime_name,
-      poster: a.cover || "",
-      episode: null,
-      day: String(day.day || "").toLowerCase(),
-      status: null,
-      updated: a.updated || null,
-      genres: [],
-    })),
+    anime_list: (Array.isArray(day.animeList) ? day.animeList : []).map((a) => {
+      const u = Number(a.updated) || null;
+      return {
+        animeId: normalizeSlug(a.link) || a.id,
+        title: a.anime_name,
+        poster: a.cover || "",
+        episode: null,
+        day: String(day.day || "").toLowerCase(),
+        status: null,
+        updated: u,
+        // label "update terakhir" siap pakai buat frontend (tanpa hitung sendiri)
+        updatedAgo: u ? Math.max(0, Math.floor(Date.now() / 1000) - u) : null,
+        updatedLabel: u ? timeAgoLabel(u) : null,
+        genres: [],
+      };
+    }),
   }));
+}
+
+// "5 menit lalu" / "3 jam lalu" / "2 hari lalu" / "3 minggu lalu"
+function timeAgoLabel(unixSec) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - Number(unixSec || 0));
+  if (!s) return null;
+  if (s < 60) return `${s} detik lalu`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} menit lalu`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} jam lalu`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d} hari lalu`;
+  const w = Math.floor(d / 7);
+  if (w < 5) return `${w} minggu lalu`;
+  const mo = Math.floor(d / 30);
+  return mo <= 1 ? "1 bulan lalu" : `${mo} bulan lalu`;
 }
 
 const GENRES = [

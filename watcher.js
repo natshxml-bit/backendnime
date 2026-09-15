@@ -17,6 +17,25 @@ const API_BASE = process.env.TSUKI_API || `http://127.0.0.1:${process.env.PORT |
 const API_KEY_QS = process.env.APP_API_KEY
   ? `?apikey=${encodeURIComponent(process.env.APP_API_KEY)}`
   : "";
+
+// Backend gate baru: jalur internal pakai header X-Internal (bukan app key).
+// Wrapper global ini nambahin header ke SEMUA fetch ke API_BASE — gak perlu
+// ngubah tiap call site. App key di query tetep dikirim buat kompatibilitas
+// selama backend masih mode audit.
+{
+  const ORIG_FETCH = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    try {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      if (u.startsWith(API_BASE)) {
+        const opts = init && typeof init === "object" ? { ...init } : {};
+        opts.headers = { ...(opts.headers || {}), "X-Internal": process.env.INTERNAL_TOKEN || "" };
+        return ORIG_FETCH(input, opts);
+      }
+    } catch {}
+    return ORIG_FETCH(input, init);
+  };
+}
 // base URL publik buat image notif FCM — FCM ngambil gambar dari luar, jadi
 // harus URL domain publik (bukan 127.0.0.1). Gambar di-proxy lewat /img
 // biar gak ditolak fetcher FCM.

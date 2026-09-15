@@ -18,7 +18,10 @@ const LIST_TYPES = ["ongoing", "finished", "movie", "all", "upcoming", "donghua"
 //   ONGOING_TTL_HOURS (default 24 jam): detail anime ongoing di-re-fetch
 //                     ~harian, bukan tiap heavy run.
 const EP_TTL_MS = (parseFloat(process.env.EP_TTL_HOURS || "168") || 168) * 60 * 60 * 1000;
-const ONGOING_TTL_MS = (parseFloat(process.env.ONGOING_TTL_HOURS || "24") || 24) * 60 * 60 * 1000;
+// Anime ONGOING wajib fresh — episode baru bisa rilis kapan aja. 90 menit
+// (bukan 24 jam) supaya detail/episode baru cepat masuk DB. Bisa diatur via
+// ONGOING_TTL_HOURS (mis. 1.5 = 90 menit).
+const ONGOING_TTL_MS = (parseFloat(process.env.ONGOING_TTL_HOURS || "1.5") || 1.5) * 60 * 60 * 1000;
 
 async function syncHome() {
   console.time("[sync] home");
@@ -86,6 +89,32 @@ async function syncDetails(count) {
 // cap = jumlah maksimal (0 = semua).
 // Hanya re-fetch detail yang belum ada / sudah lewat ONGOING_TTL_MS; yang
 // masih fresh di-skip supaya heavy run gak fetch ribuan judul tiap 6 jam.
+// Refresh detail HANYA anime yang jadwalnya HARI INI (±10 judul).
+// Tujuan: episode baru cepat masuk DB (murah — cuma 1 request jadwal +
+// ~10 detail). Dipakai LIGHT sync tiap 30 menit biar detail anime yang
+// tayang hari ini selalu fresh, tanpa nge-fetch ribuan judul.
+async function syncTodaySchedule(force = false) {
+  const days = await adapter.schedule().catch(() => null);
+  if (!Array.isArray(days) || days.length === 0) return { ok: 0, total: 0, today: null };
+  const today = days[0]; // API mengurutkan mulai hari berjalan
+  const slugs = (today.anime_list || []).map((a) => a.animeId).filter(Boolean);
+  let ok = 0, skipped = 0;
+  for (const slug of slugs) {
+    const existing = await db.get(`anime:${slug}`);
+    // force=false → skip kalau baru di-refresh <30 menit (anti boros)
+    if (!force && existing && Date.now() - existing.updatedAt < ONGOING_TTL_MS) { skipped++; continue; }
+    try {
+      const detail = await adapter.animeDetail(slug);
+      await db.set(`anime:${slug}`, detail);
+      ok++;
+    } catch (e) {
+      console.log(`[sync] today:${slug} GAGAL: ${e.message}`);
+    }
+  }
+  console.log(`[sync] jadwal hari ini (${today.day}): ${ok} detail di-refresh, ${skipped} di-skip`);
+  return { ok, skipped, total: slugs.length, today: String(today.day || "") };
+}
+
 async function syncOngoing(cap) {
   const slugs = [];
   let page = 1;
@@ -249,6 +278,7 @@ async function runSync(opts) {
   if (O.details > 0) summary.details = await syncDetails(O.details);
   if (O.allDetails) summary.allDetails = await syncAllDetails(O.allDetails === true ? {} : O.allDetails);
   if (O.ongoing) summary.ongoing = await syncOngoing(O.ongoing < 0 ? 0 : O.ongoing);
+  if (O.todaySchedule) summary.todaySchedule = await syncTodaySchedule(!!(O.forceToday));
   if (O.syncEpisodes && (O.details > 0 || O.ongoing)) {
     summary.episodes = await syncEpisodes(O.episodesPer);
   }
@@ -261,4 +291,4 @@ async function runSync(opts) {
   return summary;
 }
 
-module.exports = { runSync, syncHome, syncSchedule, syncCatalog, syncDetails, syncAllDetails, syncOngoing, syncEpisodes, syncLists, syncGenres };
+module.exports = { runSync, syncHome, syncSchedule, syncCatalog, syncDetails, syncAllDetails, syncOngoing, syncTodaySchedule, syncEpisodes, syncLists, syncGenres };

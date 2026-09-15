@@ -114,19 +114,115 @@ app.use((req, res, next) => {
 // yang sudah punya token sendiri) wajib header `X-Api-Key` == APP_API_KEY.
 // APP_API_KEY dikonfigurasi via env Railway; di-rotate → clone mati.
 const KEYLESS_PATHS = new Set(["/", "/relay"]);
+
+// ---------- SIGNED TOKEN (buat media tag yang gak bisa kirim header) ----------
+// <img>/<video> gak bisa set header X-Api-Key → dulu dipaksa pakai ?apikey=
+// (APP_API_KEY mentah nongol di URL). Sekarang: token HMAC pendek, umur
+// terbatas, cukup buat /proxy & /hls — gak bisa dipakai buat endpoint API lain.
+//   GET /media-token  (header X-Api-Key)  → { token, exp }
+//   GET /proxy?url=...&t=<token>          ← media pakai ini, bukan apikey
+const crypto = require("crypto");
+function mediaSecret() {
+  return process.env.MEDIA_SECRET || process.env.APP_API_KEY || "hikaback-media";
+}
+function signMedia(scope, ttlMs = 6 * 60 * 60 * 1000) {
+  const exp = Date.now() + ttlMs;
+  const sig = crypto.createHmac("sha256", mediaSecret()).update(`${scope}.${exp}`).digest("base64url").slice(0, 32);
+  return { token: `${exp}.${sig}`, exp };
+}
+function verifyMedia(scope, token) {
+  const s = String(token || "");
+  const i = s.indexOf(".");
+  if (i <= 0) return false;
+  const exp = parseInt(s.slice(0, i), 10);
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  const want = crypto.createHmac("sha256", mediaSecret()).update(`${scope}.${exp}`).digest("base64url").slice(0, 32);
+  const got = s.slice(i + 1);
+  try {
+    return crypto.timingSafeEqual(Buffer.from(want), Buffer.from(got));
+  } catch { return false; }
+}
+// scope media: token valid buat /proxy, /hls, /hls-seg (semua jalur media)
+app.get("/media-token", (req, res) => {
+  const key = req.get("x-api-key") || req.query.apikey;
+  if (!process.env.APP_API_KEY || key !== process.env.APP_API_KEY) {
+    return res.status(401).json({ error: "api key salah" });
+  }
+  const { token, exp } = signMedia("media", 6 * 60 * 60 * 1000);
+  res.json({ token, exp, path: "/proxy?url=...&t=" + token });
+});
 const KEYLESS_PREFIXES = ["/hls-seg/"];
-function requireAppKey(req, res, next) {
-  if (KEYLESS_PATHS.has(req.path)) return next();
-  if (KEYLESS_PREFIXES.some((p) => req.path.startsWith(p))) return next();
-  const expected = process.env.APP_API_KEY;
-  if (!expected) {
-    return res.status(503).json({ error: "APP_API_KEY belum dikonfigurasi di server" });
+
+// ---------- AUTH FIREBASE TOKEN (audit → enforce) ----------
+// Kunci utama = Firebase ID token (Authorization: Bearer) — cuma device dgn
+// app resmi (project hikanimeid-82037) yang bisa punya. APP_API_KEY jadi
+// jalur internal saja: watcher/CI kirim header X-Internal: <INTERNAL_TOKEN>.
+// AUTH_MODE env:
+//   audit   (default) — appkey-only DITERIMA tapi dicatat [auth-audit]
+//   enforce           — appkey-only ditolak 401; wajib Bearer atau X-Internal
+//   off              — behavior lama (appkey doang)
+const AUTH_MODE = String(process.env.AUTH_MODE || "audit").toLowerCase();
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || process.env.RELAY_TOKEN || "";
+const bearerCache = new Map(); // idToken -> { uid, exp } (hemat verify round-trip)
+async function verifyBearer(req) {
+  const raw = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  if (!raw || raw.length < 30) return null;
+  try {
+    const hit = bearerCache.get(raw);
+    if (hit && hit.exp > Date.now()) return hit.uid;
+    const { getAuth } = require("firebase-admin/auth");
+    const dec = await getAuth(getAdmin()).verifyIdToken(raw, false);
+    const uid = dec && dec.uid ? dec.uid : null;
+    if (uid) {
+      bearerCache.set(raw, { uid, exp: Date.now() + 5 * 60 * 1000 });
+      if (bearerCache.size > 2000) bearerCache.delete(bearerCache.keys().next().value);
+    }
+    return uid;
+  } catch {
+    return null;
   }
-  const provided = req.get("x-api-key") || req.query.apikey;
-  if (provided !== expected) {
+}
+
+async function requireAppKey(req, res, next) {
+  try {
+    if (KEYLESS_PATHS.has(req.path)) return next();
+    if (KEYLESS_PREFIXES.some((p) => req.path.startsWith(p))) return next();
+    // jalur media (/proxy, /hls, /hls-seg) boleh pakai signed token ?t=
+    // (media tag gak bisa kirim header) — selain itu tetap wajib app key.
+    if (req.path === "/proxy" || req.path === "/hls" || req.path.startsWith("/hls-seg/")) {
+      if (verifyMedia("media", req.query.t)) return next();
+    }
+    if (req.path === "/img") return next(); // proxy poster utk icon FCM — Google bot yang fetch, gak punya Bearer
+    const expected = process.env.APP_API_KEY;
+    if (!expected) {
+      return res.status(503).json({ error: "APP_API_KEY belum dikonfigurasi di server" });
+    }
+    // route admin self-guard (punya cek token sendiri di handler-nya)
+    if (req.path.startsWith("/admin/") || req.path === "/queue-stats") return next();
+    // internal service (watcher/CI): header X-Internal
+    if (INTERNAL_TOKEN && req.get("x-internal") === INTERNAL_TOKEN) {
+      req.uid = "internal";
+      return next();
+    }
+    const uid = await verifyBearer(req);
+    if (uid) {
+      req.uid = uid;
+      return next();
+    }
+    const provided = req.get("x-api-key") || req.query.apikey;
+    if (provided === expected) {
+      if (AUTH_MODE === "enforce") {
+        return res.status(401).json({ error: "token firebase wajib (app key khusus internal)" });
+      }
+      if (AUTH_MODE === "audit") {
+        console.log(`[auth-audit] ${req.method} ${req.path} via=appkey ip=${String(req.ip || "").slice(0, 18)}`);
+      }
+      return next();
+    }
     return res.status(401).json({ error: "api key salah atau hilang" });
+  } catch (e) {
+    return res.status(401).json({ error: "auth gagal: " + e.message });
   }
-  next();
 }
 app.use(requireAppKey);
 
@@ -834,8 +930,106 @@ app.get("/list/:type", wrap((req) => {
     err.status = 400;
     throw err;
   }
-  if (type === "ongoing") return dbFirst(`list:ongoing:${page}`, () => adapter.ongoing(page), 6 * 60 * 60 * 1000);
+  if (type === "ongoing") {
+    // ongoing dari otakudesu HTML (tanpa synopsis) → enrich dari DB detail
+    // (hasil backfill) biar tiap kartu ada synopsis, genres, score lengkap.
+    // MURNI baca DB — tanpa request animekita tambahan.
+    return dbFirst(`list:ongoing-enriched:${page}`, async () => {
+      const res = await adapter.ongoing(page);
+      const al = Array.isArray(res?.animeList) ? res.animeList : [];
+      const rows = await db.getAllByPrefix("anime:%");
+      const bySlug = {};
+      for (const [k, v] of Object.entries(rows || {})) {
+        bySlug[String(k).replace(/^anime:/, "").toLowerCase()] = v;
+        if (v && v.animeId) bySlug[String(v.animeId).toLowerCase()] = v;
+      }
+      const animeList = al.map((it) => {
+        const keys = [it.animeId, it.anime_id, it.endpoint].filter(Boolean).map((s) => String(s).toLowerCase());
+        let d = null;
+        for (const k of keys) { if (bySlug[k]) { d = bySlug[k]; break; } }
+        if (!d) return it;
+        const syn = String(d.synopsis || "").trim();
+        const gs = Array.isArray(d.genres) ? d.genres : [];
+        return {
+          ...it,
+          synopsis: (!it.synopsis && syn) ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : (it.synopsis || ""),
+          genres: ((!it.genres || it.genres.length === 0) && gs.length) ? gs.slice(0, 8) : (it.genres || []),
+          score: (!it.score && d.score) ? d.score : (it.score ?? null),
+          status: (!it.status && d.status) ? d.status : (it.status || null),
+        };
+      });
+      return { ...res, animeList };
+    }, 60 * 60 * 1000);
+  }
   if (type === "finished") return dbFirst(`list:finished:${page}`, () => adapter.complete(page), 6 * 60 * 60 * 1000);
+  // movie: sama kayak donghua — baca dari DB detail (type=Movie), lengkap,
+  // support filter ?genre=, urut rating. MURNI baca DB (tanpa animekita).
+  if (type === "movie") {
+    return dbFirst(`list:movie-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, async () => {
+      const rows = await db.getAllByPrefix("anime:%");
+      const gf = String(req.query.genre || "").toLowerCase().trim();
+      const items = [];
+      for (const [slug, v] of Object.entries(rows || {})) {
+        if (!v || String(v.type || "").toLowerCase() !== "movie") continue;
+        const _ms = parseFloat(v.score ?? v.rating) || 0;
+        if (!(_ms > 0 && _ms < 10)) continue; // buang entri sampah (test video, score 10)
+        const gs = Array.isArray(v.genres) ? v.genres : [];
+        if (gf && !gs.some((g) => String(g).toLowerCase().includes(gf))) continue;
+        const score = parseFloat(v.score ?? v.rating) || 0;
+        const syn = String(v.synopsis || "").trim();
+        items.push({
+          animeId: v.animeId || slug,
+          title: v.title || slug,
+          poster: v.poster || "",
+          synopsis: syn ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : "",
+          score: v.score ?? null,
+          status: v.status || null,
+          type: v.type || null,
+          genres: gs.slice(0, 4),
+          _s: score,
+        });
+      }
+      items.sort((a, b) => b._s - a._s);
+      const start = (page - 1) * 30;
+      const slice = items.slice(start, start + 30).map(({ _s, ...x }) => x);
+      return { animeList: slice, has_next: start + 30 < items.length };
+    }, 6 * 60 * 60 * 1000);
+  }
+  // donghua: baca LANGSUNG dari DB detail (type sudah terisi per anime dari
+  // backfill) — lengkap semua, paginasi bener, dan MURNI baca DB (tanpa
+  // request animekita). Diurutkan rating tertinggi. Filter genre opsional:
+  // /list/donghua?genre=action (cocok dgn data genre tiap anime, bukan scrape).
+  if (type === "donghua") {
+    return dbFirst(`list:donghua-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, async () => {
+      const rows = await db.getAllByPrefix("anime:%");
+      const gf = String(req.query.genre || "").toLowerCase().trim();
+      const items = [];
+      for (const [slug, v] of Object.entries(rows || {})) {
+        if (!v || String(v.type || "").toLowerCase() !== "donghua") continue;
+        const _ms = parseFloat(v.score ?? v.rating) || 0;
+        if (!(_ms > 0 && _ms < 10)) continue; // buang entri sampah
+        const gs = Array.isArray(v.genres) ? v.genres : [];
+        if (gf && !gs.some((g) => String(g).toLowerCase().includes(gf))) continue;
+        const score = parseFloat(v.score ?? v.rating) || 0;
+        const syn = String(v.synopsis || "").trim();
+        items.push({
+          animeId: v.animeId || slug,
+          title: v.title || slug,
+          poster: v.poster || "",
+          synopsis: syn ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : "",
+          score: v.score ?? null,
+          status: v.status || null,
+          type: v.type || null,
+          genres: gs.slice(0, 4),
+          _s: score,
+        });
+      }
+      items.sort((a, b) => b._s - a._s);
+      const start = (page - 1) * 30;
+      const slice = items.slice(start, start + 30).map(({ _s, ...x }) => x);
+      return { animeList: slice, has_next: start + 30 < items.length };
+    }, 6 * 60 * 60 * 1000);
+  }
   return dbFirst(`list:${type}:${page}`, () => adapter.listByType(type, page), 6 * 60 * 60 * 1000);
 }));
 
@@ -848,8 +1042,60 @@ app.get("/episode/*splat", wrap((req) => {
 app.get("/anime/*splat", wrap((req) => {
   const s = req.params.splat;
   const animePath = (Array.isArray(s) ? s.join("/") : String(s)).replace(/,/g, "/");
-  return dbFirst(`anime:${animePath}`, () => adapter.animeDetail(animePath), 6 * 60 * 60 * 1000);
+  // TTL pendek (30 mnt): episode baru bisa rilis kapan aja — jangan dikunci
+// 6 jam. Sync ongoing + auto-sync tetap isi DB, jadi ini cuma batas "kapan
+// boleh re-fetch", bukan kapan data disajikan (data lama tetap dipakai kalau
+// fetch gagal — lihat dbFirst).
+  return dbFirst(`anime:${animePath}`, () => adapter.animeDetail(animePath), 30 * 60 * 1000);
 }));
+
+// ---------- POPULAR ----------
+// Ranking rating tertinggi dari detail yang sudah tersimpan di DB (hasil
+// backfill). MURNI baca DB — tanpa request ke animekita, jadi bebas 403
+// dan independen dari IP server/Railway/user.
+// Query: ?limit=20 (max 100), &page=1 (opsional, batasi 100/page)
+app.get("/popular", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(String(req.query.limit || "20"), 10) || 20, 100);
+    const page = Math.max(parseInt(String(req.query.page || "1"), 10) || 1, 1);
+    const cache = await dbFirst("popular:v2", async () => {
+      // type valid anime (buang entri "Pengumuman"/spam katalog animekita)
+      const TYPE_OK = new Set(["TV", "Movie", "OVA", "ONA", "BD", "Special", "Music", "Donghua"]);
+      const rows = await db.getAllByPrefix("anime:%");
+      const items = [];
+      for (const [slug, v] of Object.entries(rows || {})) {
+        if (!v) continue;
+        const score = parseFloat(v.score ?? v.rating);
+        // rating anime nyata: 0-10 (99 & 10 bulat = entri sampah)
+        if (!Number.isFinite(score) || score <= 0 || score >= 10) continue;
+        if (!TYPE_OK.has(String(v.type || "").trim())) continue;
+        items.push({
+          animeId: v.animeId || slug,
+          title: v.title || slug,
+          poster: v.poster || "",
+          banner: v.banner || "",
+          score,
+          type: v.type || null,
+          status: v.status || null,
+          genres: Array.isArray(v.genres) ? v.genres.slice(0, 4) : [],
+        });
+      }
+      items.sort((a, b) => b.score - a.score);
+      return items;
+    }, 60 * 60 * 1000); // ranking di-cache 1 jam (murah, DB-only)
+    const start = (page - 1) * limit;
+    const items = cache.slice(start, start + limit);
+    res.json({
+      page,
+      limit,
+      total: cache.length,
+      has_next: start + limit < cache.length,
+      animeList: items,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get("/db/status", async (_req, res) => {
   try {
@@ -896,6 +1142,23 @@ app.post("/admin/cache-bust", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// GET /admin/cache-bust?prefix=anime:xxx&apikey=XXX  (versi gampang buat
+// dipanggil dari browser/curl tanpa body JSON)
+app.get("/admin/cache-bust", async (req, res) => {
+  const want = process.env.ADMIN_TOKEN || process.env.APP_API_KEY;
+  if (!want) return res.status(503).json({ error: "ADMIN_TOKEN/APP_API_KEY belum diset" });
+  const got = req.get("x-api-key") || req.query.apikey || (req.headers.authorization || "").replace(/^Bearer /, "");
+  if (got !== want) return res.status(401).json({ error: "token salah" });
+  try {
+    const prefix = String(req.query.prefix || "ep:");
+    const keys = await db.keysLike(`${prefix}%`);
+    for (const k of keys) await db.del(k);
+    res.json({ cleared: keys.length, prefix });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/config", async (_req, res) => {
   try {
     res.json({
@@ -1158,11 +1421,98 @@ app.get("/relay", async (req, res) => {
   }
 });
 
+// ---------- FILL HOOKS (backfill metadata dari worker eksternal) ----------
+// Worker eksternal (mis. Termux dgn IP rumah) tarik daftar slug yang kurang
+// di sini, fetch animekita dari IP-nya sendiri, lalu push hasilnya balik.
+// API server gak pernah nyentuh animekita untuk backfill ini → bebas 403.
+// Auth: APP_API_KEY (header X-Api-Key atau ?apikey=).
+
+// GET /fill-catalog → { queue: [slug...], existing: {slug: {syn_len, genres}} }
+app.get("/fill-catalog", async (req, res) => {
+  const key = req.get("x-api-key") || req.query.apikey;
+  if (key !== process.env.APP_API_KEY) return res.status(401).json({ error: "api key salah" });
+  try {
+    const limit = Math.min(parseInt(String(req.query.limit || "500"), 10) || 500, 2000);
+    const offset = Math.max(parseInt(String(req.query.offset || "0"), 10) || 0, 0);
+    const catalog = await db.get("catalog");
+    const items = catalog && Array.isArray(catalog.value) ? catalog.value : [];
+    const slugs = [];
+    for (const it of items) {
+      const s = it && (it.animeId || it.url || it.endpoint || it.slug);
+      if (s && !slugs.includes(s)) slugs.push(s);
+    }
+    const doneSet = new Set();
+    try {
+      const doneFile = path.join(process.cwd(), "data", "fill_done.txt");
+      fs.readFileSync(doneFile, "utf8").split(/\r?\n/).forEach((s) => { if (s.trim()) doneSet.add(s.trim()); });
+    } catch {}
+    const existing = await db.getAllByPrefix("anime:%");
+    const need = [];
+    const existingMeta = {};
+    for (const s of slugs) {
+      const v = existing[s];
+      if (!v) { if (!doneSet.has(s)) need.push(s); continue; }
+      const syn = String(v.synopsis || "").trim();
+      const gs = Array.isArray(v.genres) ? v.genres : [];
+      existingMeta[s] = { syn: syn.length, genres: gs.length };
+      if (syn.length < 20 && !doneSet.has(s)) need.push(s);
+    }
+    res.json({
+      total: slugs.length,
+      need: need.length,
+      queue: need.slice(offset, offset + limit),
+      existing: existingMeta,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /fill-detail { slug, detail } → simpan 1 detail anime
+app.post("/fill-detail", async (req, res) => {
+  const key = req.get("x-api-key") || req.query.apikey;
+  if (key !== process.env.APP_API_KEY) return res.status(401).json({ error: "api key salah" });
+  try {
+    const { slug, detail } = req.body || {};
+    if (!slug || !detail || typeof detail !== "object") {
+      return res.status(400).json({ error: "butuh { slug, detail }" });
+    }
+    const syn = String(detail.synopsis || "").trim();
+    const gs = Array.isArray(detail.genres) ? detail.genres : [];
+    if (syn.length < 20 && gs.length === 0) {
+      // kosong di sumber → tandai selesai biar gak diulang
+      const doneFile = path.join(process.cwd(), "data", "fill_done.txt");
+      fs.mkdirSync(path.dirname(doneFile), { recursive: true });
+      fs.appendFileSync(doneFile, String(slug) + "\n");
+      return res.json({ ok: true, saved: false, marked: true });
+    }
+    await db.set(`anime:${slug}`, detail);
+    const doneFile = path.join(process.cwd(), "data", "fill_done.txt");
+    fs.mkdirSync(path.dirname(doneFile), { recursive: true });
+    fs.appendFileSync(doneFile, String(slug) + "\n");
+    res.json({ ok: true, saved: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TsukiNime API on http://0.0.0.0:${PORT}`);
 });
 adapter.initBanners();
+
+// Backfill detail SEMUA anime katalog (FILL_ALL=1): jalan di proses yang sama
+// dgn app.js (share koneksi SQLite, aman dari lock). Resume-safe via
+// data/fill_done.txt. Delay default 600ms — naikkan FILL_DELAY untuk lebih
+// pelan. Matikan dengan FILL_ALL=0 lalu restart.
+if (process.env.FILL_ALL === "1") {
+  const { runFillAll } = require("./fill_all");
+  runFillAll({
+    delayMs: parseInt(process.env.FILL_DELAY || "600", 10),
+    log: (m) => console.log(m),
+  }).catch((e) => console.error("[fillall] mati:", e.message));
+}
 if (process.env.NO_CRAWL !== "1") {
   adapter.startCrawler();
   adapter.startPosterCrawler();
@@ -1186,6 +1536,9 @@ if (process.env.AUTO_SYNC_HOURS && parseFloat(process.env.AUTO_SYNC_HOURS) > 0) 
     schedule: true,
     details: 25,
     ongoing: 0,
+    // KRUSIAL: refresh detail anime yang JADWAL HARI INI (±10 judul).
+    // Ini yang bikin episode baru cepat masuk DB (bukan nunggu 24 jam).
+    todaySchedule: true,
     syncEpisodes: false,
     lists: 1,
     genres: true,
@@ -1197,6 +1550,8 @@ if (process.env.AUTO_SYNC_HOURS && parseFloat(process.env.AUTO_SYNC_HOURS) > 0) 
     catalog: true,
     details: 0,
     ongoing: -1,
+    todaySchedule: true,
+    forceToday: true,
     syncEpisodes: true,
     episodesPer: 3,
     lists: 3,

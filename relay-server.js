@@ -29,6 +29,11 @@ const server = http.createServer(async (req, res) => {
     return res.status(204).end();
   }
 
+  // Terima /scrape (format lama) dan /relay (format adapter backend) — sama saja.
+  if (req.url.split("?")[0] !== "/scrape" && req.url.split("?")[0] !== "/relay") {
+    return res.status(404).json({ error: "endpoint tidak dikenal" });
+  }
+
   if (req.headers["x-relay-token"] !== TOKEN) {
     return res.status(403).json({ error: "token relay salah" });
   }
