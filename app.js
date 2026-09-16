@@ -926,6 +926,37 @@ app.get("/complete-anime", wrap((req) => {
   return dbFirst(`list:finished:${page}`, () => adapter.complete(page), 6 * 60 * 60 * 1000);
 }));
 
+// Builder daftar per-type dr DB detail (movie/donghua) — dipakai route
+// /list/:type DAN /home-feed dgn cache key yg sama → 1x scrape tick utk smua.
+async function dbTypedList(type, page = 1, genre = "") {
+  const rows = await db.getAllByPrefix("anime:%");
+  const gf = String(genre || "").toLowerCase().trim();
+  const items = [];
+  for (const [slug, v] of Object.entries(rows || {})) {
+    if (!v || String(v.type || "").toLowerCase() !== type) continue;
+    const _ms = parseFloat(v.score ?? v.rating) || 0;
+    if (!(_ms > 0 && _ms < 10)) continue; // buang entri sampah (test/score≥10)
+    const gs = Array.isArray(v.genres) ? v.genres : [];
+    if (gf && !gs.some((g) => String(g).toLowerCase().includes(gf))) continue;
+    const syn = String(v.synopsis || "").trim();
+    items.push({
+      animeId: v.animeId || slug,
+      title: v.title || slug,
+      poster: v.poster || "",
+      synopsis: syn ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : "",
+      score: v.score ?? null,
+      status: v.status || null,
+      type: v.type || null,
+      genres: gs.slice(0, 4),
+      _s: _ms,
+    });
+  }
+  items.sort((a, b) => b._s - a._s);
+  const start = (page - 1) * 30;
+  const slice = items.slice(start, start + 30).map(({ _s, ...x }) => x);
+  return { animeList: slice, has_next: start + 30 < items.length };
+}
+
 app.get("/list/:type", wrap((req) => {
   const type = req.params.type;
   const page = parseInt(req.query.page, 10) || 1;
@@ -969,70 +1000,14 @@ app.get("/list/:type", wrap((req) => {
   // movie: sama kayak donghua — baca dari DB detail (type=Movie), lengkap,
   // support filter ?genre=, urut rating. MURNI baca DB (tanpa animekita).
   if (type === "movie") {
-    return dbFirst(`list:movie-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, async () => {
-      const rows = await db.getAllByPrefix("anime:%");
-      const gf = String(req.query.genre || "").toLowerCase().trim();
-      const items = [];
-      for (const [slug, v] of Object.entries(rows || {})) {
-        if (!v || String(v.type || "").toLowerCase() !== "movie") continue;
-        const _ms = parseFloat(v.score ?? v.rating) || 0;
-        if (!(_ms > 0 && _ms < 10)) continue; // buang entri sampah (test video, score 10)
-        const gs = Array.isArray(v.genres) ? v.genres : [];
-        if (gf && !gs.some((g) => String(g).toLowerCase().includes(gf))) continue;
-        const score = parseFloat(v.score ?? v.rating) || 0;
-        const syn = String(v.synopsis || "").trim();
-        items.push({
-          animeId: v.animeId || slug,
-          title: v.title || slug,
-          poster: v.poster || "",
-          synopsis: syn ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : "",
-          score: v.score ?? null,
-          status: v.status || null,
-          type: v.type || null,
-          genres: gs.slice(0, 4),
-          _s: score,
-        });
-      }
-      items.sort((a, b) => b._s - a._s);
-      const start = (page - 1) * 30;
-      const slice = items.slice(start, start + 30).map(({ _s, ...x }) => x);
-      return { animeList: slice, has_next: start + 30 < items.length };
-    }, 6 * 60 * 60 * 1000);
+    return dbFirst(`list:movie-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, () => dbTypedList("movie", page, req.query.genre), 6 * 60 * 60 * 1000);
   }
   // donghua: baca LANGSUNG dari DB detail (type sudah terisi per anime dari
   // backfill) — lengkap semua, paginasi bener, dan MURNI baca DB (tanpa
   // request animekita). Diurutkan rating tertinggi. Filter genre opsional:
   // /list/donghua?genre=action (cocok dgn data genre tiap anime, bukan scrape).
   if (type === "donghua") {
-    return dbFirst(`list:donghua-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, async () => {
-      const rows = await db.getAllByPrefix("anime:%");
-      const gf = String(req.query.genre || "").toLowerCase().trim();
-      const items = [];
-      for (const [slug, v] of Object.entries(rows || {})) {
-        if (!v || String(v.type || "").toLowerCase() !== "donghua") continue;
-        const _ms = parseFloat(v.score ?? v.rating) || 0;
-        if (!(_ms > 0 && _ms < 10)) continue; // buang entri sampah
-        const gs = Array.isArray(v.genres) ? v.genres : [];
-        if (gf && !gs.some((g) => String(g).toLowerCase().includes(gf))) continue;
-        const score = parseFloat(v.score ?? v.rating) || 0;
-        const syn = String(v.synopsis || "").trim();
-        items.push({
-          animeId: v.animeId || slug,
-          title: v.title || slug,
-          poster: v.poster || "",
-          synopsis: syn ? (syn.length > 400 ? syn.slice(0, 400) + "…" : syn) : "",
-          score: v.score ?? null,
-          status: v.status || null,
-          type: v.type || null,
-          genres: gs.slice(0, 4),
-          _s: score,
-        });
-      }
-      items.sort((a, b) => b._s - a._s);
-      const start = (page - 1) * 30;
-      const slice = items.slice(start, start + 30).map(({ _s, ...x }) => x);
-      return { animeList: slice, has_next: start + 30 < items.length };
-    }, 6 * 60 * 60 * 1000);
+    return dbFirst(`list:donghua-v2:${page}:${String(req.query.genre || "").toLowerCase()}`, () => dbTypedList("donghua", page, req.query.genre), 6 * 60 * 60 * 1000);
   }
   return dbFirst(`list:${type}:${page}`, () => adapter.listByType(type, page), 6 * 60 * 60 * 1000);
 }));
@@ -1058,35 +1033,41 @@ app.get("/anime/*splat", wrap((req) => {
 // backfill). MURNI baca DB — tanpa request ke animekita, jadi bebas 403
 // dan independen dari IP server/Railway/user.
 // Query: ?limit=20 (max 100), &page=1 (opsional, batasi 100/page)
+// Builder ranking popular (DB-only) — di-share route /popular & /home-feed
+// biar cache key "popular:v2" cuma ada satu sumber builder.
+function popularRanking() {
+  return dbFirst("popular:v2", async () => {
+    // type valid anime (buang entri "Pengumuman"/spam katalog animekita)
+    const TYPE_OK = new Set(["TV", "Movie", "OVA", "ONA", "BD", "Special", "Music", "Donghua"]);
+    const rows = await db.getAllByPrefix("anime:%");
+    const items = [];
+    for (const [slug, v] of Object.entries(rows || {})) {
+      if (!v) continue;
+      const score = parseFloat(v.score ?? v.rating);
+      // rating anime nyata: 0-10 (99 & 10 bulat = entri sampah)
+      if (!Number.isFinite(score) || score <= 0 || score >= 10) continue;
+      if (!TYPE_OK.has(String(v.type || "").trim())) continue;
+      items.push({
+        animeId: v.animeId || slug,
+        title: v.title || slug,
+        poster: v.poster || "",
+        banner: v.banner || "",
+        score,
+        type: v.type || null,
+        status: v.status || null,
+        genres: Array.isArray(v.genres) ? v.genres.slice(0, 4) : [],
+      });
+    }
+    items.sort((a, b) => b.score - a.score);
+    return items;
+  }, 60 * 60 * 1000); // ranking di-cache 1 jam (murah, DB-only)
+}
+
 app.get("/popular", async (req, res) => {
   try {
     const limit = Math.min(parseInt(String(req.query.limit || "20"), 10) || 20, 100);
     const page = Math.max(parseInt(String(req.query.page || "1"), 10) || 1, 1);
-    const cache = await dbFirst("popular:v2", async () => {
-      // type valid anime (buang entri "Pengumuman"/spam katalog animekita)
-      const TYPE_OK = new Set(["TV", "Movie", "OVA", "ONA", "BD", "Special", "Music", "Donghua"]);
-      const rows = await db.getAllByPrefix("anime:%");
-      const items = [];
-      for (const [slug, v] of Object.entries(rows || {})) {
-        if (!v) continue;
-        const score = parseFloat(v.score ?? v.rating);
-        // rating anime nyata: 0-10 (99 & 10 bulat = entri sampah)
-        if (!Number.isFinite(score) || score <= 0 || score >= 10) continue;
-        if (!TYPE_OK.has(String(v.type || "").trim())) continue;
-        items.push({
-          animeId: v.animeId || slug,
-          title: v.title || slug,
-          poster: v.poster || "",
-          banner: v.banner || "",
-          score,
-          type: v.type || null,
-          status: v.status || null,
-          genres: Array.isArray(v.genres) ? v.genres.slice(0, 4) : [],
-        });
-      }
-      items.sort((a, b) => b.score - a.score);
-      return items;
-    }, 60 * 60 * 1000); // ranking di-cache 1 jam (murah, DB-only)
+    const cache = await popularRanking();
     const start = (page - 1) * limit;
     const items = cache.slice(start, start + limit);
     res.json({
@@ -1499,6 +1480,58 @@ app.post("/fill-detail", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ---------- HOME FEED (1 request = semua section home) ----------
+// Agregasi DARI CACHE YANG SAMA dgn endpoint aslinya (home, list:donghua-v2,
+// list:movie-v2, popular:v2, genres) — jadi gak ada scrape dobel; tick sync
+// tetap 1x untuk semua. Memo 60s in-memory biar burst launch (resume) gak
+// nembak DB berkali2. Ringanin respon: synopsis dipotong 160 char (hero card
+// gak butuh full), tanpa banner buat list kecil.
+let _feedMemo = { at: 0, data: null };
+app.get("/home-feed", wrap(async (_req, res) => {
+  if (_feedMemo.wrapped && Date.now() - _feedMemo.at < 60 * 1000) return _feedMemo.wrapped;
+  const trim = (items, cap) => (Array.isArray(items) ? items : []).slice(0, cap).map((it) => {
+    if (!it || typeof it !== "object") return it;
+    const s = String(it.synopsis || "");
+    return s.length > 160 ? { ...it, synopsis: s.slice(0, 160) + "…" } : it;
+  });
+  const [home, donghua, movie, popular, genres] = await Promise.all([
+    dbFirst("home", () => adapter.home(), 5 * 60 * 1000),
+    dbFirst("list:donghua-v2:1:", () => dbTypedList("donghua", 1), 6 * 60 * 60 * 1000),
+    dbFirst("list:movie-v2:1:", () => dbTypedList("movie", 1), 6 * 60 * 60 * 1000),
+    popularRanking().catch(() => []),
+    dbFirst("genres", () => adapter.genres(), 24 * 60 * 60 * 1000).catch(() => []),
+  ]);
+  const h = home || {};
+  const ongoing = h.ongoing && Array.isArray(h.ongoing.animeList) ? h.ongoing : { animeList: [] };
+  const completed = h.completed && Array.isArray(h.completed.animeList) ? h.completed : { animeList: [] };
+  const film = h.film && Array.isArray(h.film.animeList) ? h.film : { animeList: [] };
+  // hero card butuh banner — pakai helper yang sama dgn /home
+  const enrichHero = (items = []) => items.map((it) => {
+    if (!it || it.banner) return it;
+    const b = adapter.getBannerFor(it.animeId);
+    if (b) return { ...it, banner: b };
+    adapter.queueBannerSearch(it.title, it.animeId);
+    return it;
+  });
+  // "latest" = ekor dari daftar recent (upload ke-16 dst) — gratis, tanpa
+  // fetch tambahan (sumbernya baruupload yg sama, sudah di-cache "home").
+  const allRecent = Array.isArray(h.recent) ? h.recent : [];
+  const data = {
+    recent: enrichHero(trim(allRecent, 15)),
+    ongoing: { ...ongoing, animeList: trim(ongoing.animeList, 15) },
+    completed: { ...completed, animeList: trim(completed.animeList, 15) },
+    latest: trim(allRecent.slice(15, 27), 12),
+    movie: { animeList: trim(film.animeList || movie?.animeList, 12) },
+    donghua: { animeList: trim(donghua?.animeList, 12) },
+    popular: { animeList: trim(popular, 12) },
+    genres,
+    serverTime: Date.now(),
+  };
+  const wrapped = { status: "success", data };
+  _feedMemo = { at: Date.now(), data, wrapped };
+  return wrapped;
+}));
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
