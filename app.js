@@ -1543,6 +1543,11 @@ app.get("/home-feed", wrap(async (_req, res) => {
 // Idempoten: dokumen klaim pakai id deterministik (animeId__episodeId), jadi
 // request dobel/retry gak bisa dobel XP.
 const XP_REWARD = parseInt(process.env.XP_REWARD || "50", 10);
+// Reward per event — biar gampang di-tune tanpa ubah kode.
+const XP_REWARDS = {
+  watch: parseInt(process.env.XP_REWARD_WATCH || "50", 10),
+  daily: parseInt(process.env.XP_REWARD_DAILY || "50", 10),
+};
 const XP_DAILY_CAP = parseInt(process.env.XP_DAILY_CAP || "100", 10); // jumlah klaim/hari
 const XP_MIN_PERCENT = parseFloat(process.env.XP_MIN_PERCENT || "0.8"); // ≥80%
 
@@ -1552,13 +1557,68 @@ function todayKeyWib() {
   return t.toISOString().slice(0, 10);
 }
 
+// Nambah XP ke users/{uid}.totalXp (atomic) + balikin total sebelum.
+async function addXp(userRef, amount) {
+  const before = await userRef.get();
+  const beforeTotal = Number((before.data() || {}).totalXp ?? (before.data() || {}).exp ?? 0);
+  await userRef.set({
+    totalXp: FieldValue.increment(amount),
+    xpUpdatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return { beforeTotal };
+}
+// Bentuk response seragam buat semua event XP.
+function xpResult(beforeTotal, gained, claimLeftToday) {
+  const totalXp = beforeTotal + gained;
+  const levelBefore = getLevelFromTotalXp(beforeTotal);
+  const levelAfter = getLevelFromTotalXp(totalXp);
+  const need = getNextLevelXp(levelAfter);
+  return {
+    status: "success",
+    data: {
+      totalXp,
+      gained,
+      level: levelAfter,
+      levelUp: levelAfter > levelBefore,
+      nextLevelXp: need === Infinity ? null : need,
+      claimLeftToday,
+    },
+  };
+}
+// Sisa klaim hari ini (buat info di response).
+async function claimLeftToday(userRef, day) {
+  const s = await userRef.collection("xpDaily").doc(day).get();
+  return Math.max(0, XP_DAILY_CAP - Number(s.data()?.count || 0));
+}
+
 app.post("/xp/claim", async (req, res) => {
   try {
     const uid = req.uid;
     if (!uid || uid === "internal") return res.status(401).json({ error: "butuh login user (Bearer token)" });
     const { event = "watch", animeId, episodeId } = req.body || {};
+    const reward = XP_REWARDS[event];
+    if (!reward) return res.status(400).json({ error: "event tidak dikenal" });
+
+    const { getFirestore: gfs } = require("firebase-admin/firestore");
+    const fs = gfs(getAdmin());
+    const userRef = fs.collection("users").doc(uid);
+    const day = todayKeyWib();
+
+    // ---- EVENT: daily (login harian) — sekali per hari WIB, gak butuh anime
+    if (event === "daily") {
+      const dailyRef = userRef.collection("xpClaims").doc(`daily__${day}`);
+      const dailySnap = await dailyRef.get();
+      if (dailySnap.exists) {
+        const us = await userRef.get();
+        return res.status(409).json({ error: "daily sudah diklaim hari ini", totalXp: Number(us.data()?.totalXp || 0) });
+      }
+      await dailyRef.set({ event: "daily", day, reward, at: FieldValue.serverTimestamp() });
+      const { beforeTotal } = await addXp(userRef, reward);
+      return res.json(xpResult(beforeTotal, reward, await claimLeftToday(userRef, day)));
+    }
+
+    // ---- EVENT: watch (nonton episode) — butuh animeId + episodeId valid
     if (!animeId || !episodeId) return res.status(400).json({ error: "animeId & episodeId wajib" });
-    if (event !== "watch") return res.status(400).json({ error: "event tidak dikenal" });
 
     // 1) episode harus beneran ada di katalog (anti-claim karangan)
     const rec = await db.get(`anime:${animeId}`);
@@ -1568,9 +1628,6 @@ app.post("/xp/claim", async (req, res) => {
     const ep = list.find((e) => e && (e.episodeId === episodeId || e.endpoint === episodeId));
     if (!ep) return res.status(404).json({ error: "episode tidak ada di anime ini" });
 
-    const { getFirestore: gfs } = require("firebase-admin/firestore");
-    const fs = gfs(getAdmin());
-    const userRef = fs.collection("users").doc(uid);
     const claimRef = userRef.collection("xpClaims").doc(`${animeId}__${episodeId}`);
 
     // 2) progress ≥80% dari epProgress (yang ditulis saat nonton)
@@ -1592,7 +1649,6 @@ app.post("/xp/claim", async (req, res) => {
     if (already.exists) {
       return res.status(409).json({ error: "episode ini sudah diklaim", totalXp: Number(uData.totalXp || 0) });
     }
-    const day = todayKeyWib();
     const dayRef = userRef.collection("xpDaily").doc(day);
     const daySnap = await dayRef.get();
     const usedToday = Number(daySnap.data()?.count || 0);
@@ -1600,33 +1656,15 @@ app.post("/xp/claim", async (req, res) => {
       return res.status(429).json({ error: "cap XP harian tercapai", cap: XP_DAILY_CAP });
     }
 
-    // 4) tulis: klaim + counter harian + totalXp (atomic-ish)
-    const beforeTotal = Number(uData.totalXp ?? uData.exp ?? 0);
+    // 4) tulis: klaim + counter harian + totalXp (atomic)
     await claimRef.set({
       animeId, episodeId, event,
-      percent, reward: XP_REWARD,
+      percent, reward,
       at: FieldValue.serverTimestamp(),
     });
     await dayRef.set({ count: FieldValue.increment(1), day }, { merge: true });
-    await userRef.set({
-      totalXp: FieldValue.increment(XP_REWARD),
-      xpUpdatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    const totalXp = beforeTotal + XP_REWARD;
-    const levelBefore = getLevelFromTotalXp(beforeTotal);
-    const levelAfter = getLevelFromTotalXp(totalXp);
-    res.json({
-      status: "success",
-      data: {
-        totalXp,
-        gained: XP_REWARD,
-        level: levelAfter,
-        levelUp: levelAfter > levelBefore,
-        nextLevelXp: getNextLevelXp(levelAfter) === Infinity ? null : getNextLevelXp(levelAfter),
-        claimLeftToday: Math.max(0, XP_DAILY_CAP - (usedToday + 1)),
-      },
-    });
+    const { beforeTotal } = await addXp(userRef, reward);
+    res.json(xpResult(beforeTotal, reward, Math.max(0, XP_DAILY_CAP - (usedToday + 1))));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1651,7 +1689,12 @@ app.get("/xp/me", async (req, res) => {
         nextLevelXp: getNextLevelXp(getLevelFromTotalXp(totalXp)) === Infinity ? null : getNextLevelXp(getLevelFromTotalXp(totalXp)),
         claimLeftToday: Math.max(0, XP_DAILY_CAP - Number(daySnap.data()?.count || 0)),
         dailyCap: XP_DAILY_CAP,
-        rewardPerClaim: XP_REWARD,
+        rewardPerClaim: XP_REWARDS.watch,
+        rewards: XP_REWARDS,
+        dailyClaimedToday: await (async () => {
+          const s = await fs.collection("users").doc(uid).collection("xpClaims").doc(`daily__${todayKeyWib()}`).get();
+          return s.exists;
+        })(),
       },
     });
   } catch (e) {
