@@ -1533,6 +1533,132 @@ app.get("/home-feed", wrap(async (_req, res) => {
   return wrapped;
 }));
 
+// ---------- XP CLAIM (server-authoritative) ----------
+// XP cuma nambah lewat sini — klien TIDAK boleh nulis totalXp/level sendiri
+// (diblokir Firestore rules). Alur:
+//   1. klien nonton → ProgressStore nyimpen users/{uid}.epProgress (a/e/p/s)
+//   2. klien panggil POST /xp/claim {event, animeId, episodeId}
+//   3. server: cek episode ADA di katalog + progress >=80% + belum pernah
+//      diklaim + cap harian → totalXp += reward (FieldValue.increment)
+// Idempoten: dokumen klaim pakai id deterministik (animeId__episodeId), jadi
+// request dobel/retry gak bisa dobel XP.
+const XP_REWARD = parseInt(process.env.XP_REWARD || "50", 10);
+const XP_DAILY_CAP = parseInt(process.env.XP_DAILY_CAP || "100", 10); // jumlah klaim/hari
+const XP_MIN_PERCENT = parseFloat(process.env.XP_MIN_PERCENT || "0.8"); // ≥80%
+
+function todayKeyWib() {
+  // batas "hari" pakai WIB (UTC+7) biar cocok dgn kebiasaan user Indonesia
+  const t = new Date(Date.now() + 7 * 3600 * 1000);
+  return t.toISOString().slice(0, 10);
+}
+
+app.post("/xp/claim", async (req, res) => {
+  try {
+    const uid = req.uid;
+    if (!uid || uid === "internal") return res.status(401).json({ error: "butuh login user (Bearer token)" });
+    const { event = "watch", animeId, episodeId } = req.body || {};
+    if (!animeId || !episodeId) return res.status(400).json({ error: "animeId & episodeId wajib" });
+    if (event !== "watch") return res.status(400).json({ error: "event tidak dikenal" });
+
+    // 1) episode harus beneran ada di katalog (anti-claim karangan)
+    const rec = await db.get(`anime:${animeId}`);
+    const detail = rec && rec.value;
+    if (!detail) return res.status(404).json({ error: "anime tidak ada di katalog" });
+    const list = Array.isArray(detail.episodeList) ? detail.episodeList : [];
+    const ep = list.find((e) => e && (e.episodeId === episodeId || e.endpoint === episodeId));
+    if (!ep) return res.status(404).json({ error: "episode tidak ada di anime ini" });
+
+    const { getFirestore: gfs } = require("firebase-admin/firestore");
+    const fs = gfs(getAdmin());
+    const userRef = fs.collection("users").doc(uid);
+    const claimRef = userRef.collection("xpClaims").doc(`${animeId}__${episodeId}`);
+
+    // 2) progress ≥80% dari epProgress (yang ditulis saat nonton)
+    const userSnap = await userRef.get();
+    const uData = userSnap.data() || {};
+    const epProgress = Array.isArray(uData.epProgress) ? uData.epProgress : [];
+    const entry = epProgress.find((e) => e && String(e.a) === String(animeId) && String(e.e) === String(episodeId));
+    const percent = entry ? Number(entry.p) || 0 : 0;
+    if (percent < XP_MIN_PERCENT) {
+      return res.status(400).json({
+        error: "belum selesai ditonton",
+        percent,
+        butuh: XP_MIN_PERCENT,
+      });
+    }
+
+    // 3) sekali per episode (idempoten) + cap harian
+    const already = await claimRef.get();
+    if (already.exists) {
+      return res.status(409).json({ error: "episode ini sudah diklaim", totalXp: Number(uData.totalXp || 0) });
+    }
+    const day = todayKeyWib();
+    const dayRef = userRef.collection("xpDaily").doc(day);
+    const daySnap = await dayRef.get();
+    const usedToday = Number(daySnap.data()?.count || 0);
+    if (usedToday >= XP_DAILY_CAP) {
+      return res.status(429).json({ error: "cap XP harian tercapai", cap: XP_DAILY_CAP });
+    }
+
+    // 4) tulis: klaim + counter harian + totalXp (atomic-ish)
+    const beforeTotal = Number(uData.totalXp ?? uData.exp ?? 0);
+    await claimRef.set({
+      animeId, episodeId, event,
+      percent, reward: XP_REWARD,
+      at: FieldValue.serverTimestamp(),
+    });
+    await dayRef.set({ count: FieldValue.increment(1), day }, { merge: true });
+    await userRef.set({
+      totalXp: FieldValue.increment(XP_REWARD),
+      xpUpdatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    const totalXp = beforeTotal + XP_REWARD;
+    const levelBefore = getLevelFromTotalXp(beforeTotal);
+    const levelAfter = getLevelFromTotalXp(totalXp);
+    res.json({
+      status: "success",
+      data: {
+        totalXp,
+        gained: XP_REWARD,
+        level: levelAfter,
+        levelUp: levelAfter > levelBefore,
+        nextLevelXp: getNextLevelXp(levelAfter) === Infinity ? null : getNextLevelXp(levelAfter),
+        claimLeftToday: Math.max(0, XP_DAILY_CAP - (usedToday + 1)),
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ringkasan XP user (biar klien gak perlu baca Firestore langsung buat XP)
+app.get("/xp/me", async (req, res) => {
+  try {
+    const uid = req.uid;
+    if (!uid || uid === "internal") return res.status(401).json({ error: "butuh login user (Bearer token)" });
+    const { getFirestore: gfs2 } = require("firebase-admin/firestore");
+    const fs = gfs2(getAdmin());
+    const snap = await fs.collection("users").doc(uid).get();
+    const d = snap.data() || {};
+    const totalXp = Number(d.totalXp ?? d.exp ?? 0);
+    const daySnap = await fs.collection("users").doc(uid).collection("xpDaily").doc(todayKeyWib()).get();
+    res.json({
+      status: "success",
+      data: {
+        totalXp,
+        level: getLevelFromTotalXp(totalXp),
+        nextLevelXp: getNextLevelXp(getLevelFromTotalXp(totalXp)) === Infinity ? null : getNextLevelXp(getLevelFromTotalXp(totalXp)),
+        claimLeftToday: Math.max(0, XP_DAILY_CAP - Number(daySnap.data()?.count || 0)),
+        dailyCap: XP_DAILY_CAP,
+        rewardPerClaim: XP_REWARD,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TsukiNime API on http://0.0.0.0:${PORT}`);
