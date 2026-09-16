@@ -1558,14 +1558,18 @@ function todayKeyWib() {
 }
 
 // Nambah XP ke users/{uid}.totalXp (atomic) + balikin total sebelum.
-async function addXp(userRef, amount) {
-  const before = await userRef.get();
-  const beforeTotal = Number((before.data() || {}).totalXp ?? (before.data() || {}).exp ?? 0);
+// Tulis XP (atomic increment). beforeTotal DIKIRIM dari pemanggil (yang udah
+// baca user doc) → hemat 1 read per klaim.
+async function addXp(userRef, amount, beforeTotal) {
   await userRef.set({
     totalXp: FieldValue.increment(amount),
     xpUpdatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
-  return { beforeTotal };
+  return { beforeTotal: Number(beforeTotal) || 0 };
+}
+// Helper baca totalXp dari data user doc.
+function totalXpOf(d) {
+  return Number((d || {}).totalXp ?? (d || {}).exp ?? 0);
 }
 // Bentuk response seragam buat semua event XP.
 function xpResult(beforeTotal, gained, claimLeftToday) {
@@ -1586,9 +1590,11 @@ function xpResult(beforeTotal, gained, claimLeftToday) {
   };
 }
 // Sisa klaim hari ini (buat info di response).
-async function claimLeftToday(userRef, day) {
-  const s = await userRef.collection("xpDaily").doc(day).get();
-  return Math.max(0, XP_DAILY_CAP - Number(s.data()?.count || 0));
+// Sisa klaim hari ini — dihitung dari user doc (tanpa read tambahan).
+function claimLeftFrom(d, day) {
+  const c = d && d.xpClaimedToday && String(d.xpClaimedToday.day) === String(day)
+    ? Number(d.xpClaimedToday.count) || 0 : 0;
+  return Math.max(0, XP_DAILY_CAP - c);
 }
 
 app.post("/xp/claim", async (req, res) => {
@@ -1606,15 +1612,21 @@ app.post("/xp/claim", async (req, res) => {
 
     // ---- EVENT: daily (login harian) — sekali per hari WIB, gak butuh anime
     if (event === "daily") {
-      const dailyRef = userRef.collection("xpClaims").doc(`daily__${day}`);
-      const dailySnap = await dailyRef.get();
-      if (dailySnap.exists) {
-        const us = await userRef.get();
-        return res.status(409).json({ error: "daily sudah diklaim hari ini", totalXp: Number(us.data()?.totalXp || 0) });
+      const us = await userRef.get();               // 1 read
+      const d = us.data() || {};
+      const beforeTotal = totalXpOf(d);
+      if (String(d.dailyClaimedDay || "") === day) { // cek dari user doc (tanpa read subkoleksi)
+        return res.status(409).json({ error: "daily sudah diklaim hari ini", totalXp: beforeTotal });
       }
-      await dailyRef.set({ event: "daily", day, reward, at: FieldValue.serverTimestamp() });
-      const { beforeTotal } = await addXp(userRef, reward);
-      return res.json(xpResult(beforeTotal, reward, await claimLeftToday(userRef, day)));
+      const dailyRef = userRef.collection("xpClaims").doc(`daily__${day}`);
+      await dailyRef.set({ event: "daily", day, reward, at: FieldValue.serverTimestamp() }); // write 1 (audit)
+      await userRef.set({                             // write 2 (XP + status, sekali jalan)
+        totalXp: FieldValue.increment(reward),
+        xpUpdatedAt: FieldValue.serverTimestamp(),
+        dailyClaimedDay: day,
+        xpClaimedToday: { day, count: FieldValue.increment(1) },
+      }, { merge: true });
+      return res.json(xpResult(beforeTotal, reward, claimLeftFrom(d, day) - 1));
     }
 
     // ---- EVENT: watch (nonton episode) — butuh animeId + episodeId valid
@@ -1631,7 +1643,7 @@ app.post("/xp/claim", async (req, res) => {
     const claimRef = userRef.collection("xpClaims").doc(`${animeId}__${episodeId}`);
 
     // 2) progress ≥80% dari epProgress (yang ditulis saat nonton)
-    const userSnap = await userRef.get();
+    const userSnap = await userRef.get();          // 1 read (dipakai berkali2)
     const uData = userSnap.data() || {};
     const epProgress = Array.isArray(uData.epProgress) ? uData.epProgress : [];
     const entry = epProgress.find((e) => e && String(e.a) === String(animeId) && String(e.e) === String(episodeId));
@@ -1651,7 +1663,7 @@ app.post("/xp/claim", async (req, res) => {
     }
     const dayRef = userRef.collection("xpDaily").doc(day);
     const daySnap = await dayRef.get();
-    const usedToday = Number(daySnap.data()?.count || 0);
+    const usedToday = XP_DAILY_CAP - claimLeftFrom(uData, day);
     if (usedToday >= XP_DAILY_CAP) {
       return res.status(429).json({ error: "cap XP harian tercapai", cap: XP_DAILY_CAP });
     }
@@ -1662,9 +1674,13 @@ app.post("/xp/claim", async (req, res) => {
       percent, reward,
       at: FieldValue.serverTimestamp(),
     });
-    await dayRef.set({ count: FieldValue.increment(1), day }, { merge: true });
-    const { beforeTotal } = await addXp(userRef, reward);
-    res.json(xpResult(beforeTotal, reward, Math.max(0, XP_DAILY_CAP - (usedToday + 1))));
+    // 1 write ke user doc: XP + counter harian (sekali jalan)
+    await userRef.set({
+      totalXp: FieldValue.increment(reward),
+      xpUpdatedAt: FieldValue.serverTimestamp(),
+      xpClaimedToday: { day, count: FieldValue.increment(1) },
+    }, { merge: true });
+    res.json(xpResult(totalXpOf(uData), reward, XP_DAILY_CAP - (usedToday + 1)));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1680,21 +1696,18 @@ app.get("/xp/me", async (req, res) => {
     const snap = await fs.collection("users").doc(uid).get();
     const d = snap.data() || {};
     const totalXp = Number(d.totalXp ?? d.exp ?? 0);
-    const daySnap = await fs.collection("users").doc(uid).collection("xpDaily").doc(todayKeyWib()).get();
     res.json({
       status: "success",
       data: {
         totalXp,
         level: getLevelFromTotalXp(totalXp),
         nextLevelXp: getNextLevelXp(getLevelFromTotalXp(totalXp)) === Infinity ? null : getNextLevelXp(getLevelFromTotalXp(totalXp)),
-        claimLeftToday: Math.max(0, XP_DAILY_CAP - Number(daySnap.data()?.count || 0)),
+        claimLeftToday: Math.max(0, XP_DAILY_CAP - Number(d.xpClaimedToday?.count || 0)),
         dailyCap: XP_DAILY_CAP,
         rewardPerClaim: XP_REWARDS.watch,
         rewards: XP_REWARDS,
-        dailyClaimedToday: await (async () => {
-          const s = await fs.collection("users").doc(uid).collection("xpClaims").doc(`daily__${todayKeyWib()}`).get();
-          return s.exists;
-        })(),
+        // TANPA read tambahan — dibaca dari user doc yang udah di-fetch
+        dailyClaimedToday: String(d.dailyClaimedDay || "") === todayKeyWib(),
       },
     });
   } catch (e) {
